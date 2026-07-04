@@ -525,16 +525,34 @@ window.navassist.STATES = STATES;
 window.navassist.transitionTo = transitionTo;
 
 // ============================================================
-// Bootstrap
+// Bootstrap -- splash screen handles the autoplay unlock
 // ============================================================
 
 window.addEventListener('load', async () => {
     await loadConfig();
-    connectWebSocket();
-    startGpsTracking();
-    updateUI(STATES.IDLE);
 
-    setTimeout(() => {
-        speak('NavAssist loaded. Waiting for glasses to connect.', false);
-    }, 1000);
+    const splashScreen = document.getElementById('splashScreen');
+    const mainApp = document.getElementById('mainApp');
+    const splashButton = document.getElementById('splashButton');
+
+    splashButton.addEventListener('click', () => {
+        // This tap is the user interaction that unlocks browser audio.
+        // Everything after this point can play sound freely.
+
+        // Hide splash, show main app
+        splashScreen.classList.add('hidden');
+        mainApp.classList.remove('hidden');
+
+        // Now safe to speak -- audio is unlocked
+        speak(
+            'NavAssist ready. Waiting for glasses to connect. ' +
+            'Once connected, tap once to start scanning for a pedestrian crossing.',
+            false
+        );
+
+        // Start everything else
+        connectWebSocket();
+        startGpsTracking();
+        updateUI(STATES.IDLE);
+    });
 });

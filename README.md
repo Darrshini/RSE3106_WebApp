@@ -1,13 +1,13 @@
 # NavAssist Web App
 
-Assistive navigation web app for visually impaired users — RSE3106 James Dyson Award submission
+Assistive navigation web app for visually impaired users — RSE3106 Capstone / James Dyson Award
 
 ## Team
 
 | Member | File | Responsibility |
 |---|---|---|
 | Darrshini | `public/js/app.js` | ESP32 comms, GPS, haptic commands, state machine |
-| Kim Hyeonghu | `public/js/ai.js` | Camera processing, AI inference, direction logic |
+| [Teammate] | `public/js/ai.js` | Camera processing, AI inference, direction logic |
 
 ---
 
@@ -37,7 +37,7 @@ npm install
 ### 2. Set up API keys
 ```bash
 cp .env.example .env
-# Create a file called .env on same folder and fill in your actual keys
+# Edit .env and fill in your actual keys
 ```
 
 ### 3. Start the server
