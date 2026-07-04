@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>NavAssist</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+    <!-- Status bar -->
+    <div class="status-bar">
+        <div id="connectionStatus" class="status-indicator status-disconnected">
+            <span class="status-dot"></span>
+            <span id="connectionText">ESP32 disconnected</span>
+        </div>
+        <div id="appStateLabel" class="state-label">IDLE</div>
+    </div>
+
+    <!-- Main content -->
+    <main class="main-content">
+        <div id="contextMessage" class="context-message" aria-live="polite">
+            Waiting for connection...
+        </div>
+
+        <!-- Single big button -->
+        <button id="mainButton" class="main-button" aria-label="Start scan" disabled>
+            <span id="buttonIcon" class="button-icon">▶</span>
+            <span id="buttonLabel" class="button-label">Tap to start</span>
+        </button>
+
+        <div id="gestureHint" class="gesture-hint" aria-hidden="true"></div>
+    </main>
+
+    <!-- Settings button -->
+    <a href="settings.html" class="settings-link" aria-label="Open settings">⚙</a>
+
+    <!-- Debug panel (visible during development, hide for demo) -->
+    <div id="debugPanel" class="debug-panel">
+        <div id="debugLog"></div>
+    </div>
+
+    <script src="js/app.js"></script>
+    <script src="js/ai.js"></script>
+</body>
+</html>
