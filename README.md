@@ -37,7 +37,7 @@ npm install
 ### 2. Set up API keys
 ```bash
 cp .env.example .env
-# Edit .env and fill in your actual keys
+# Create a file called .env on same folder and fill in your actual keys
 ```
 
 ### 3. Start the server
