@@ -22,6 +22,9 @@ ESP32-CAM (glasses hardware)
 ```
 
 The Node.js server relays messages between the browser and the ESP32. All intelligence runs in the browser.
+ - ENSURE YOU HAVE NODE.JS INSTALLED ON YOUR PC OR LAPTOP. CHECK IN TERMINAL : node --version
+ - if you see an error , install Node.js from this site: https://nodejs.org/en/download
+ - ensure node.js is installed before starting the next setup instructions below:
 
 ---
 
