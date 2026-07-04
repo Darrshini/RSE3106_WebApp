@@ -58,6 +58,20 @@ ESP32 should connect to:
   ws://192.168.x.x:3000/esp32
 ```
 
+**if you cannot access, its because of your Windows Firewall. These are some steps to help with allowing port 3000 connections:**
+
+### Windows Firewall GUI method:
+
+1. Press Windows key → search "Windows Defender Firewall" → open it
+2. Click "Advanced settings" on the left
+3. Click "Inbound Rules" on the left
+4. Click "New Rule..." on the right
+5. Select Port → Next
+6. Select TCP, enter 3000 in "Specific local ports" → Next
+7. Select Allow the connection → Next
+8. Tick all three boxes (Domain, Private, Public) → Next
+9. Name it NavAssist or this project name → Finish
+
 ### 4. Open the web app
 Open `http://localhost:3000` in Chrome on your phone or laptop.
 
