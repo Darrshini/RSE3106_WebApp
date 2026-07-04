@@ -1,13 +1,13 @@
 # NavAssist Web App
 
-Assistive navigation web app for visually impaired users — RSE3106 Capstone / James Dyson Award
+Assistive navigation web app for visually impaired users — RSE3106 James Dyson Award submission
 
 ## Team
 
 | Member | File | Responsibility |
 |---|---|---|
 | Darrshini | `public/js/app.js` | ESP32 comms, GPS, haptic commands, state machine |
-| [Teammate] | `public/js/ai.js` | Camera processing, AI inference, direction logic |
+| Kim Hyeonghu | `public/js/ai.js` | Camera processing, AI inference, direction logic |
 
 ---
 
