@@ -15,9 +15,9 @@ Assistive navigation web app for visually impaired users — RSE3106 James Dyson
 
 ```
 Browser (index.html)
-    ↕ WebSocket ws://laptop-ip:3000/browser
+    ↕ WebSocket ws://laptop-ip:80/browser
 Node.js server (server.js) — running on laptop
-    ↕ WebSocket ws://laptop-ip:3000/esp32
+    ↕ WebSocket ws://laptop-ip:80/esp32
 ESP32-CAM (glasses hardware)
 ```
 
