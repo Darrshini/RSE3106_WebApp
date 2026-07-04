@@ -22,7 +22,7 @@ const { WebSocketServer } = require('ws');
 const http = require('http');
 const path = require('path');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 80;
 
 // ============================================================
 // Express -- serves your HTML/CSS/JS files to the browser
@@ -171,29 +171,44 @@ function sendToEsp32(message) {
 server.listen(PORT, '0.0.0.0', () => {
     const { networkInterfaces } = require('os');
     const nets = networkInterfaces();
-    let localIp = 'unknown';
+    const candidates = [];
 
-    // Find the laptop's WiFi IP to display for the ESP32 to connect to
-    for (const iface of Object.values(nets)) {
-        for (const net of iface) {
-            if (net.family === 'IPv4' && !net.internal) {
-                localIp = net.address;
-                break;
+    // Collect all non-internal IPv4 addresses
+    for (const [name, ifaces] of Object.entries(nets)) {
+        for (const iface of ifaces) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                candidates.push({ name, address: iface.address });
             }
         }
-        if (localIp !== 'unknown') break;
     }
+
+    // Prefer WiFi interface over others (Ethernet, VPN, virtual adapters)
+    const wifi = candidates.find(c =>
+        c.name.toLowerCase().includes('wi-fi') ||
+        c.name.toLowerCase().includes('wlan') ||
+        c.name.toLowerCase().includes('wireless')
+    );
+    const best = wifi || candidates[0];
+    const localIp = best ? best.address : 'unknown';
 
     console.log('\n========================================');
     console.log(' NavAssist Server Running');
     console.log('========================================');
     console.log(`\n Open the web app at:`);
     console.log(`   http://localhost:${PORT}          (on this laptop)`);
-    console.log(`   http://${localIp}:${PORT}   (on any device on same WiFi)\n`);
+    console.log(`   http://${localIp}:${PORT}   (on phone/any device on same WiFi)\n`);
     console.log(` ESP32 should connect to:`);
     console.log(`   ws://${localIp}:${PORT}/esp32\n`);
     console.log(` Browser WebSocket connects to:`);
     console.log(`   ws://${localIp}:${PORT}/browser`);
+
+    // Show ALL detected IPs so you can pick the right one if needed
+    if (candidates.length > 1) {
+        console.log('\n All detected network interfaces:');
+        candidates.forEach(c => console.log(`   ${c.name}: ${c.address}`));
+        console.log(' If the IP above looks wrong, use ipconfig to find the correct one.');
+    }
+
     console.log('\n----------------------------------------');
     console.log(' Waiting for connections...\n');
 });
