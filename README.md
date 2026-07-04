@@ -29,8 +29,8 @@ The Node.js server relays messages between the browser and the ESP32. All intell
 
 ### 1. Clone and install
 ```bash
-git clone https://github.com/your-org/navassist-webapp.git
-cd navassist-webapp
+git clone https://github.com/Darrshini/RSE3106_WebApp.git
+cd RSE3106_WebApp
 npm install
 ```
 
