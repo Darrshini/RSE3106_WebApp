@@ -8,7 +8,7 @@
 </head>
 <body>
 
-    <!-- Splash screen -- shown first, requires one tap to unlock audio -->
+    <!-- Splash screen -->
     <div id="splashScreen" class="splash-screen">
         <div class="splash-content">
             <div class="splash-icon">🦯</div>
@@ -20,16 +20,17 @@
         </div>
     </div>
 
-    <!-- Main app -- hidden until splash is dismissed -->
+    <!-- Main app -->
     <div id="mainApp" class="main-app hidden">
 
-        <!-- Status bar -->
+        <!-- Status bar: connection | state | settings (all in one row, no overlap) -->
         <div class="status-bar">
             <div id="connectionStatus" class="status-indicator status-disconnected">
                 <span class="status-dot"></span>
-                <span id="connectionText">ESP32 disconnected</span>
+                <span id="connectionText">Glasses disconnected</span>
             </div>
             <div id="appStateLabel" class="state-label">IDLE</div>
+            <a href="settings.html" class="settings-link" aria-label="Open settings">⚙</a>
         </div>
 
         <!-- Main content -->
@@ -46,10 +47,7 @@
             <div id="gestureHint" class="gesture-hint" aria-hidden="true"></div>
         </main>
 
-        <!-- Settings button -->
-        <a href="settings.html" class="settings-link" aria-label="Open settings">⚙</a>
-
-        <!-- Debug panel -->
+        <!-- Debug panel: hidden by default, add class "visible" to show -->
         <div id="debugPanel" class="debug-panel">
             <div id="debugLog"></div>
         </div>

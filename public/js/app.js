@@ -165,16 +165,63 @@ function handleHeartbeat(payload) {
 }
 
 // ============================================================
-// IMU data -- exposed globally so ai.js can read current heading
+// IMU data -- from ESP32 glasses (relative motion)
+// AND phone compass (absolute heading) combined
 // ============================================================
 
-let currentHeading = 0;
+let currentHeading = 0;      // absolute compass heading from phone
 let imuCalibrated = false;
+let phoneCompassAvailable = false;
+
+// Phone's own compass -- primary source for absolute heading
+// This works regardless of whether ESP32 IMU has a magnetometer
+function initPhoneCompass() {
+    if (typeof DeviceOrientationEvent === 'undefined') {
+        debugLog('Phone compass not available in this browser');
+        return;
+    }
+
+    // iOS 13+ requires permission
+    if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission()
+            .then(response => {
+                if (response === 'granted') {
+                    window.addEventListener('deviceorientation', handleDeviceOrientation);
+                    phoneCompassAvailable = true;
+                    debugLog('Phone compass permission granted');
+                }
+            })
+            .catch(err => debugLog('Compass permission denied: ' + err));
+    } else {
+        // Android -- no permission needed
+        window.addEventListener('deviceorientation', handleDeviceOrientation);
+        phoneCompassAvailable = true;
+        debugLog('Phone compass initialised');
+    }
+}
+
+function handleDeviceOrientation(event) {
+    // event.alpha = compass heading (0-360°, 0=North) on Android
+    if (event.alpha !== null) {
+        currentHeading = event.alpha;
+        imuCalibrated = true;
+    }
+}
 
 function handleImuReading(payload) {
-    currentHeading = payload.heading_deg || 0;
-    imuCalibrated = payload.calibrated || false;
-    debugLog(`IMU: heading=${currentHeading.toFixed(1)}° calibrated=${imuCalibrated}`);
+    // ESP32 IMU gives us pitch/roll/gyro -- useful for detecting
+    // if user is turning, but phone compass gives absolute heading
+    const pitch  = payload.pitch_deg || 0;
+    const roll   = payload.roll_deg  || 0;
+    const gyroZ  = payload.gyro_z    || 0;
+
+    // Only use ESP32 heading if phone compass unavailable
+    if (!phoneCompassAvailable && payload.heading_deg) {
+        currentHeading = payload.heading_deg;
+        imuCalibrated  = payload.calibrated || false;
+    }
+
+    debugLog(`IMU: heading=${currentHeading.toFixed(1)}° pitch=${pitch.toFixed(1)}° gyroZ=${gyroZ.toFixed(1)}`);
 }
 
 // Expose for ai.js
@@ -189,6 +236,15 @@ window.navassist.isImuCalibrated = () => imuCalibrated;
 let currentLocation = null;
 
 function startGpsTracking() {
+    // GPS requires HTTPS or localhost in modern browsers
+    // If on HTTP (e.g. AWS without SSL), GPS will be blocked
+    if (location.protocol === 'http:' && location.hostname !== 'localhost') {
+        debugLog('GPS blocked: requires HTTPS. GPS features disabled on HTTP.');
+        // Don't show error to user -- GPS is enhancement, not blocker
+        // Junction lookup will be skipped gracefully if no location
+        return;
+    }
+
     if (!navigator.geolocation) {
         debugLog('GPS not available in this browser');
         return;
@@ -203,7 +259,6 @@ function startGpsTracking() {
             };
             debugLog(`GPS: ${currentLocation.latitude.toFixed(5)}, ${currentLocation.longitude.toFixed(5)} ±${currentLocation.accuracyMeters.toFixed(0)}m`);
 
-            // If currently resolving junction, retry with new fix
             if (currentState === STATES.RESOLVING) {
                 resolveJunction();
             }
@@ -353,17 +408,31 @@ window.navassist.onGreenDetected = function() {
 };
 
 // ============================================================
-// Button gesture detection
+// Gesture detection -- listens on ENTIRE SCREEN
+// Visually impaired users cannot reliably find a specific button
+// so any tap anywhere on the screen counts as a gesture.
+// The button on screen is purely visual reference for sighted helpers.
 // ============================================================
 
-const mainButton = document.getElementById('mainButton');
 const TAP_WINDOW_MS = 400;
 let tapCount = 0;
 let tapTimer = null;
+let lastTapTime = 0;
 
-mainButton.addEventListener('click', () => {
+// Listen on the whole document, not just the button
+document.addEventListener('touchstart', handleScreenTap, { passive: true });
+document.addEventListener('click', handleScreenTap);
+
+function handleScreenTap(e) {
+    // Ignore taps on the settings link -- let that navigate normally
+    if (e.target.closest('.settings-link')) return;
+    // Ignore taps on the back button in settings
+    if (e.target.closest('.back-button')) return;
+
     tapCount++;
-    // Tiny immediate vibration so user knows tap registered
+    lastTapTime = Date.now();
+
+    // Immediate feedback -- tiny vibration so user knows tap registered
     if (navigator.vibrate) navigator.vibrate(20);
 
     clearTimeout(tapTimer);
@@ -371,12 +440,7 @@ mainButton.addEventListener('click', () => {
         classifyGesture(tapCount);
         tapCount = 0;
     }, TAP_WINDOW_MS);
-});
-
-mainButton.addEventListener('touchstart', () => {
-    const label = mainButton.getAttribute('aria-label') || 'Button';
-    speak(label, false);
-}, { passive: true });
+}
 
 function classifyGesture(count) {
     const gestureMap = { 1: 'single_tap', 2: 'double_tap', 3: 'triple_tap' };
@@ -387,7 +451,19 @@ function classifyGesture(count) {
     const intent = rules[gesture];
 
     if (!intent) {
-        speak('This action is not available right now.');
+        // Tell user what's available right now
+        const available = Object.keys(rules);
+        if (available.length === 0) {
+            speak('No action available right now.');
+        } else {
+            const hints = available.map(g => {
+                if (g === 'single_tap') return 'tap once';
+                if (g === 'double_tap') return 'double tap';
+                if (g === 'triple_tap') return 'triple tap';
+                return g;
+            }).join(' or ');
+            speak(`Try ${hints}.`);
+        }
         return;
     }
 
@@ -451,7 +527,13 @@ const UI_CONFIG = {
 function updateUI(state, customMessage = null) {
     const cfg = UI_CONFIG[state] || UI_CONFIG.IDLE;
     const btn = document.getElementById('mainButton');
-    btn.disabled = !cfg.enabled;
+
+    // Button is never truly disabled -- tapping anywhere on screen works.
+    // We just change the visual appearance to reflect state for sighted helpers.
+    // Keep disabled only for IDLE and LOST_CONNECTION where nothing should happen.
+    const trulyDisabled = (state === STATES.IDLE || state === STATES.LOST_CONNECTION);
+    btn.disabled = trulyDisabled;
+
     btn.className = 'main-button ' + cfg.cls;
     btn.setAttribute('aria-label', cfg.label);
     document.getElementById('buttonIcon').textContent = cfg.icon;
@@ -477,7 +559,12 @@ function speak(text, interrupt = true) {
     if (!window.speechSynthesis) return;
     if (interrupt) window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
-    u.rate = 1.05; u.volume = 1.0;
+
+    // Read settings saved by settings.js
+    const settings = JSON.parse(localStorage.getItem('navassist_settings') || '{}');
+    u.rate   = (settings.speechRate   || 105) / 100;
+    u.volume = (settings.audioVolume  || 85)  / 100;
+
     window.speechSynthesis.speak(u);
 }
 
@@ -506,14 +593,22 @@ function announceState(state, customMessage = null) {
 
 function debugLog(msg) {
     console.log('[NavAssist]', msg);
-    const el = document.getElementById('debugLog');
-    if (el) {
-        const line = document.createElement('div');
-        line.textContent = `${new Date().toLocaleTimeString()} ${msg}`;
-        el.appendChild(line);
-        el.scrollTop = el.scrollHeight;
-        // Keep only last 20 lines
-        while (el.children.length > 20) el.removeChild(el.firstChild);
+
+    // Only show in debug panel if debug mode is enabled in settings
+    const settings = JSON.parse(localStorage.getItem('navassist_settings') || '{}');
+    const debugPanel = document.getElementById('debugPanel');
+    if (debugPanel) {
+        if (settings.debugMode) {
+            debugPanel.classList.add('visible');
+        }
+        const el = document.getElementById('debugLog');
+        if (el && settings.debugMode) {
+            const line = document.createElement('div');
+            line.textContent = `${new Date().toLocaleTimeString()} ${msg}`;
+            el.appendChild(line);
+            el.scrollTop = el.scrollHeight;
+            while (el.children.length > 20) el.removeChild(el.firstChild);
+        }
     }
 }
 
@@ -553,6 +648,7 @@ window.addEventListener('load', async () => {
         // Start everything else
         connectWebSocket();
         startGpsTracking();
+        initPhoneCompass();
         updateUI(STATES.IDLE);
     });
 });

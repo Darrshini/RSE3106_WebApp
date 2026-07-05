@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>NavAssist — Settings</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="settings-page">
+
+    <!-- Header -->
+    <div class="settings-header">
+        <a href="index.html" class="back-button" aria-label="Back to main screen">←</a>
+        <h1 class="settings-title">Settings</h1>
+    </div>
+
+    <!-- Settings content -->
+    <div class="settings-content">
+
+        <!-- Haptic intensity -->
+        <div class="setting-group">
+            <label class="setting-label" for="hapticIntensity">
+                Haptic intensity
+                <span id="hapticValue" class="setting-value">70%</span>
+            </label>
+            <p class="setting-description">Controls how strongly the glasses vibrate to guide you.</p>
+            <input type="range" id="hapticIntensity" class="setting-slider"
+                min="0" max="100" value="70"
+                aria-label="Haptic intensity 70 percent">
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- Audio volume -->
+        <div class="setting-group">
+            <label class="setting-label" for="audioVolume">
+                Audio volume
+                <span id="audioValue" class="setting-value">85%</span>
+            </label>
+            <p class="setting-description">Controls the volume of spoken announcements.</p>
+            <input type="range" id="audioVolume" class="setting-slider"
+                min="0" max="100" value="85"
+                aria-label="Audio volume 85 percent">
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- Speech rate -->
+        <div class="setting-group">
+            <label class="setting-label" for="speechRate">
+                Speech rate
+                <span id="speechValue" class="setting-value">Normal</span>
+            </label>
+            <p class="setting-description">Controls how fast the voice speaks.</p>
+            <input type="range" id="speechRate" class="setting-slider"
+                min="50" max="200" value="105"
+                aria-label="Speech rate normal">
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- High contrast -->
+        <div class="setting-group">
+            <div class="setting-row-toggle">
+                <label class="setting-label" for="highContrast">High contrast mode</label>
+                <button id="highContrast" class="toggle-button"
+                    role="switch" aria-checked="false"
+                    aria-label="High contrast mode off">
+                    <span class="toggle-thumb"></span>
+                </button>
+            </div>
+            <p class="setting-description">Increases screen contrast for better visibility.</p>
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- Debug mode -->
+        <div class="setting-group">
+            <div class="setting-row-toggle">
+                <label class="setting-label" for="debugMode">Debug mode</label>
+                <button id="debugMode" class="toggle-button"
+                    role="switch" aria-checked="false"
+                    aria-label="Debug mode off">
+                    <span class="toggle-thumb"></span>
+                </button>
+            </div>
+            <p class="setting-description">Shows technical log at the bottom of the screen. Turn off for demo.</p>
+        </div>
+
+        <div class="settings-divider"></div>
+
+        <!-- Connection info -->
+        <div class="setting-group">
+            <p class="setting-label">Server connection</p>
+            <p class="setting-description" id="serverInfo">Loading...</p>
+        </div>
+
+        <p class="settings-note">
+            All settings are saved automatically.<br>
+            Each change is confirmed by voice.
+        </p>
+
+    </div>
+</div>
+
+<script src="js/settings.js"></script>
+</body>
+</html>
