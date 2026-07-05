@@ -1,4 +1,6 @@
 Work in progress..., welp will try to finish by tuesday ;-;
+This branch will not be merged since its just code to flash into ESP32
+This is not final code, since i need to integrate this code with Zhen Ye's one that he flashed on his ESP32
 
 
 Circuit diagram from Neo Zhen Ye:
@@ -8,7 +10,7 @@ Circuit diagram from Neo Zhen Ye:
 ESP32 Firmware code will be based on this circuit diagram
 
 ## Two firmware files — which to use when
-### navassist_test_firmware — flash this on your bare ESP32-CAM:
+### navassist_test_firmware — flash this on your bare ESP32-CAM (the one without camera, IMU or haptic motors set up):
 
 - No camera, IMU, or motors needed
 - Sends fake heartbeats, fake IMU, fake frames
