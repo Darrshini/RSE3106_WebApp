@@ -15,9 +15,9 @@ Assistive navigation web app for visually impaired users — RSE3106 James Dyson
 
 ```
 Browser (index.html)
-    ↕ WebSocket ws://laptop-ip:80/browser
+    ↕ WebSocket ws://laptop-ip:3000/browser
 Node.js server (server.js) — running on laptop
-    ↕ WebSocket ws://laptop-ip:80/esp32
+    ↕ WebSocket ws://laptop-ip:3000/esp32
 ESP32-CAM (glasses hardware)
 ```
 
@@ -51,20 +51,20 @@ npm start
 You'll see:
 ```
 Open the web app at:
-  http://localhost:80         (on this laptop)
-  http://192.168.x.x:80       (on any device on same WiFi)
+  http://localhost:3000         (on this laptop)
+  http://192.168.x.x:3000       (on any device on same WiFi)
 
 ESP32 should connect to:
-  ws://192.168.x.x:80/esp32
+  ws://192.168.x.x:3000/esp32
 ```
 
 ### 4. Open the web app
-Open `http://localhost:80` in Chrome on your phone or laptop.
+Open `http://localhost:3000` in Chrome on your phone or laptop.
 
 ### 5. Flash the ESP32
 Update the ESP32 firmware with:
 - WiFi credentials (your laptop's hotspot or same router)
-- WebSocket URL: `ws://192.168.x.x:80/esp32`
+- WebSocket URL: `ws://192.168.x.x:3000/esp32`
 
 ---
 
