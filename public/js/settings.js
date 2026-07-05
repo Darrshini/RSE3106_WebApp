@@ -136,12 +136,42 @@ debugBtn.addEventListener('click', () => {
 function speak(text) {
     if (!window.speechSynthesis) return;
     window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    const settings = loadSettings();
-    u.rate   = settings.speechRate / 100;
-    u.volume = settings.audioVolume / 100;
-    window.speechSynthesis.speak(u);
+
+    const sayIt = () => {
+        const u = new SpeechSynthesisUtterance(text);
+        const s = loadSettings();
+        u.rate   = (s.speechRate  || 105) / 100;
+        u.volume = (s.audioVolume || 85)  / 100;
+        window.speechSynthesis.speak(u);
+    };
+
+    // Desktop Chrome needs voices to load first
+    const voices = window.speechSynthesis.getVoices();
+    if (voices.length > 0) {
+        sayIt();
+    } else {
+        window.speechSynthesis.addEventListener('voiceschanged', sayIt, { once: true });
+    }
 }
+
+// ============================================================
+// Audio unlock -- required for desktop browsers
+// ============================================================
+
+let audioUnlocked = false;
+
+function unlockAudio() {
+    if (audioUnlocked) return;
+    if (window.speechSynthesis) {
+        const u = new SpeechSynthesisUtterance('');
+        u.volume = 0;
+        window.speechSynthesis.speak(u);
+        audioUnlocked = true;
+    }
+}
+
+document.addEventListener('click',      unlockAudio, { once: true });
+document.addEventListener('touchstart', unlockAudio, { once: true });
 
 // ============================================================
 // Bootstrap
