@@ -1,6 +1,6 @@
 Work in progress..., welp will try to finish by tuesday ;-;
-This branch will not be merged since its just code to flash into ESP32
-This is not final code, since i need to integrate this code with Zhen Ye's one that he flashed on his ESP32
+This branch will not be merged since its just code to flash into ESP32.
+This is not final code, since i need to integrate this code with Zhen Ye's one that he flashed on his ESP32.
 
 
 Circuit diagram from Neo Zhen Ye:
