@@ -146,11 +146,17 @@ function handleConnectionEvent(payload) {
     if (event === 'esp32_connected') {
         clearTimeout(heartbeatTimer);
         updateConnectionStatus(true);
-        transitionTo(STATES.READY, 'Glasses connected. Tap once to start scanning.');
+        // Clear announcement so user knows glasses are ready
+        speak('Glasses connected successfully. Tap anywhere to start scanning.', true);
+        transitionTo(STATES.READY);
     } else if (event === 'esp32_disconnected') {
         updateConnectionStatus(false);
         if (currentState !== STATES.IDLE) {
-            transitionTo(STATES.LOST_CONNECTION, 'Glasses disconnected. Please reconnect.');
+            speak('Glasses disconnected. Please check the connection.', true);
+            transitionTo(STATES.LOST_CONNECTION);
+        } else {
+            // Still in IDLE -- just update status, no state change needed
+            speak('Waiting for glasses to connect. Please ensure glasses are powered on and connected to WiFi.', true);
         }
     }
 }
@@ -451,18 +457,37 @@ function classifyGesture(count) {
     const intent = rules[gesture];
 
     if (!intent) {
-        // Tell user what's available right now
-        const available = Object.keys(rules);
-        if (available.length === 0) {
-            speak('No action available right now.');
-        } else {
-            const hints = available.map(g => {
-                if (g === 'single_tap') return 'tap once';
-                if (g === 'double_tap') return 'double tap';
-                if (g === 'triple_tap') return 'triple tap';
-                return g;
-            }).join(' or ');
-            speak(`Try ${hints}.`);
+        // Give a helpful, state-specific message rather than a vague one
+        switch (currentState) {
+            case STATES.IDLE:
+                speak('Waiting for glasses to connect. Please ensure your glasses are powered on.');
+                break;
+            case STATES.LOST_CONNECTION:
+                speak('Glasses disconnected. Please check that your glasses are powered on and connected to WiFi.');
+                break;
+            case STATES.SCANNING:
+            case STATES.RESOLVING:
+                speak('Scanning in progress. Please wait.');
+                break;
+            case STATES.NAVIGATING:
+                speak('Follow the haptic feedback on the glasses to reach the crossing.');
+                break;
+            case STATES.WAITING:
+                speak('Please wait for the green man signal.');
+                break;
+            case STATES.CROSSING:
+                speak('Cross now. Walk straight ahead.');
+                break;
+            case STATES.READY:
+                speak('Tap anywhere once to start scanning for a crossing.');
+                break;
+            case STATES.CONFIRM_TARGET:
+            case STATES.CONFIRM_CROSSING:
+                speak('Double tap anywhere to confirm yes, or triple tap to try again.');
+                break;
+            default:
+                // Re-announce current state message
+                announceState(currentState);
         }
         return;
     }
@@ -626,29 +651,31 @@ window.navassist.transitionTo = transitionTo;
 window.addEventListener('load', async () => {
     await loadConfig();
 
+    // Apply saved high contrast setting immediately on load
+    const settings = JSON.parse(localStorage.getItem('navassist_settings') || '{}');
+    if (settings.highContrast) {
+        document.body.classList.add('high-contrast');
+    }
+
     const splashScreen = document.getElementById('splashScreen');
     const mainApp = document.getElementById('mainApp');
     const splashButton = document.getElementById('splashButton');
 
     splashButton.addEventListener('click', () => {
-        // This tap is the user interaction that unlocks browser audio.
-        // Everything after this point can play sound freely.
-
-        // Hide splash, show main app
+        // This tap unlocks browser audio -- everything after can play sound
         splashScreen.classList.add('hidden');
         mainApp.classList.remove('hidden');
 
-        // Now safe to speak -- audio is unlocked
-        speak(
-            'NavAssist ready. Waiting for glasses to connect. ' +
-            'Once connected, tap once to start scanning for a pedestrian crossing.',
-            false
-        );
-
-        // Start everything else
         connectWebSocket();
         startGpsTracking();
         initPhoneCompass();
         updateUI(STATES.IDLE);
+
+        // Clear announcement of current state
+        speak(
+            'NavAssist started. Waiting for glasses to connect. ' +
+            'Please ensure your glasses are powered on and connected to WiFi.',
+            false
+        );
     });
 });
