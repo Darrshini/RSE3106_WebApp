@@ -22,7 +22,7 @@ const { WebSocketServer } = require('ws');
 const http = require('http');
 const path = require('path');
 
-const PORT = process.env.PORT || 80;
+const PORT = process.env.PORT || 3000;
 
 // ============================================================
 // Express -- serves your HTML/CSS/JS files to the browser
