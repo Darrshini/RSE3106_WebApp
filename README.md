@@ -15,7 +15,7 @@ ESP32 Firmware code will be based on this circuit diagram
 - Confirms WiFi → AWS server → phone browser pipeline works end to end
 - You'll see "Glasses connected successfully" on your phone when it connects
 
-## navassist_full_firmware — flash this when you meet your team:
+### navassist_full_firmware — flash this when you meet your team:
 
 - Requires camera (OV5640), MPU-6050, and motors wired up
 - Sends real JPEG frames to Roboflow via ai.js
