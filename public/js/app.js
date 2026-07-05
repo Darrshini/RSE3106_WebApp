@@ -215,17 +215,18 @@ function handleDeviceOrientation(event) {
 }
 
 function handleImuReading(payload) {
-    // ESP32 IMU gives us pitch/roll/gyro -- useful for detecting
-    // if user is turning, but phone compass gives absolute heading
     const pitch  = payload.pitch_deg || 0;
     const roll   = payload.roll_deg  || 0;
     const gyroZ  = payload.gyro_z    || 0;
 
-    // Only use ESP32 heading if phone compass unavailable
+    // Use phone compass if available (more accurate for absolute heading)
     if (!phoneCompassAvailable && payload.heading_deg) {
         currentHeading = payload.heading_deg;
         imuCalibrated  = payload.calibrated || false;
     }
+
+    // Use gyroscope to detect significant turns during navigation
+    handleImuForTurnDetection(gyroZ);
 
     debugLog(`IMU: heading=${currentHeading.toFixed(1)}° pitch=${pitch.toFixed(1)}° gyroZ=${gyroZ.toFixed(1)}`);
 }
@@ -287,20 +288,65 @@ window.navassist.getCurrentLocation = () => currentLocation;
 // Junction resolution -- GPS + Google Maps
 // ============================================================
 
+// ============================================================
+// Junction resolution
+// Works WITHOUT absolute compass heading (no magnetometer)
+//
+// Strategy:
+// 1. GPS confirms a crossing exists nearby (within 80m)
+// 2. Camera (via ai.js) confirms user can see a traffic light
+// 3. Gyroscope tracks relative turns to help re-orient user
+// 4. Street name announced if GPS available, generic if not
+// ============================================================
+
+// Stores nearby crossings found by GPS -- used for announcements
+let nearbyCrossings = [];
+let selectedCrossingIndex = 0;
+
+// Gyroscope tracking for relative turn detection
+let cumulativeGyroZ = 0;
+let lastGyroCheck = Date.now();
+const SIGNIFICANT_TURN_DEG = 45; // announce re-orientation if user turns this much
+
+function handleImuForTurnDetection(gyroZ) {
+    const now = Date.now();
+    const dt = (now - lastGyroCheck) / 1000; // seconds since last reading
+    lastGyroCheck = now;
+
+    // Integrate gyro Z to estimate cumulative rotation
+    cumulativeGyroZ += gyroZ * dt;
+
+    // If user has turned significantly during navigation, remind them of direction
+    if (Math.abs(cumulativeGyroZ) > SIGNIFICANT_TURN_DEG) {
+        if (currentState === STATES.NAVIGATING) {
+            speak('You have turned away. Follow the haptic feedback to re-orient toward the crossing.');
+        }
+        cumulativeGyroZ = 0; // reset after announcement
+    }
+}
+
 async function resolveJunction() {
-    if (!currentLocation) {
-        speak('Waiting for GPS signal. Please step outside if indoors.');
+    // GPS available (HTTPS) -- use Maps API for crossing names
+    if (currentLocation && location.protocol === 'https:') {
+        await resolveJunctionWithGPS();
+    } else {
+        // No GPS (HTTP) or no fix yet -- rely on camera detection only
+        resolveJunctionWithCameraOnly();
+    }
+}
+
+async function resolveJunctionWithGPS() {
+    if (currentLocation.accuracyMeters > 30) {
+        speak('GPS signal is weak. Please wait a moment or move to an open area.');
+        // Retry after 3 seconds
+        setTimeout(resolveJunction, 3000);
         return;
     }
 
-    if (currentLocation.accuracyMeters > 25) {
-        speak('GPS signal is weak. Please wait a moment.');
-        return;
-    }
-
-    debugLog(`Resolving junction at ${currentLocation.latitude.toFixed(5)},${currentLocation.longitude.toFixed(5)}`);
+    debugLog(`GPS junction lookup: ${currentLocation.latitude.toFixed(5)}, ${currentLocation.longitude.toFixed(5)}`);
 
     try {
+        // Use Google Maps Places API to find nearby traffic signals
         const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json` +
             `?location=${currentLocation.latitude},${currentLocation.longitude}` +
             `&radius=80&type=traffic_signals` +
@@ -310,49 +356,87 @@ async function resolveJunction() {
         const data = await res.json();
 
         if (data.status !== 'OK' || !data.results.length) {
-            debugLog('No crossings found nearby');
-            speak('No pedestrian crossing found nearby. Keep walking.');
+            debugLog('No crossings found via GPS -- falling back to camera');
+            resolveJunctionWithCameraOnly();
             return;
         }
 
-        // Calculate bearing from user to each crossing
-        const crossings = data.results.map(place => ({
-            name: place.name,
-            bearing: calculateBearing(
+        // Store all nearby crossings for user to cycle through
+        nearbyCrossings = data.results.map(place => ({
+            name: place.name || 'Pedestrian crossing',
+            lat: place.geometry.location.lat,
+            lng: place.geometry.location.lng,
+            distance: haversineMeters(
                 currentLocation.latitude, currentLocation.longitude,
-                place.geometry.location.lat,
-                place.geometry.location.lng
+                place.geometry.location.lat, place.geometry.location.lng
             )
         }));
 
-        debugLog(`Found ${crossings.length} crossings`);
+        // Sort by distance -- nearest first
+        nearbyCrossings.sort((a, b) => a.distance - b.distance);
+        selectedCrossingIndex = 0;
 
-        // Pick the crossing closest to the user's current heading
-        const target = crossings.reduce((best, crossing) => {
-            const diff = headingDifference(currentHeading, crossing.bearing);
-            return diff < headingDifference(currentHeading, best.bearing) ? crossing : best;
-        });
-
-        const headingDiff = headingDifference(currentHeading, target.bearing);
-
-        if (headingDiff <= 30) {
-            // User is facing this crossing -- good match
-            transitionTo(STATES.TARGET_DETECTED,
-                `Crossing found: ${target.name}. Is this correct?`);
-            setTimeout(() => {
-                if (currentState === STATES.TARGET_DETECTED) {
-                    transitionTo(STATES.CONFIRM_TARGET,
-                        'Double tap to confirm this crossing, triple tap to try again.');
-                }
-            }, 2000);
-        } else {
-            speak(`Found ${crossings.length} crossings nearby. Please face the crossing you want to use.`);
-        }
+        debugLog(`Found ${nearbyCrossings.length} crossing(s) nearby`);
+        announceCurrentCrossing();
 
     } catch (e) {
         debugLog('Maps API error: ' + e.message);
-        speak('Could not look up nearby crossings. Please try again.');
+        // Fall back gracefully to camera-only mode
+        resolveJunctionWithCameraOnly();
     }
+}
+
+function resolveJunctionWithCameraOnly() {
+    // No GPS or Maps -- tell user we detected a crossing via camera
+    // ai.js will call window.navassist.onTrafficLightVisible() when it sees a light
+    debugLog('Camera-only junction resolution mode');
+    speak(
+        'Scanning for a pedestrian crossing. ' +
+        'Please walk slowly toward the crossing you want to use.'
+    );
+    transitionTo(STATES.SCANNING);
+}
+
+function announceCurrentCrossing() {
+    if (nearbyCrossings.length === 0) {
+        resolveJunctionWithCameraOnly();
+        return;
+    }
+
+    const crossing = nearbyCrossings[selectedCrossingIndex];
+    const distanceText = crossing.distance < 20
+        ? 'very close'
+        : `about ${Math.round(crossing.distance)} metres away`;
+
+    // Announce the crossing with its name and distance
+    const message = `Crossing found: ${crossing.name}, ${distanceText}. ` +
+        `Double tap to confirm this is your crossing. ` +
+        (nearbyCrossings.length > 1
+            ? `Triple tap to hear the next crossing. There are ${nearbyCrossings.length} crossings nearby.`
+            : `Triple tap if this is not correct.`);
+
+    transitionTo(STATES.TARGET_DETECTED);
+    setTimeout(() => {
+        if (currentState === STATES.TARGET_DETECTED) {
+            transitionTo(STATES.CONFIRM_TARGET, message);
+            // Reset gyro tracking for this navigation session
+            cumulativeGyroZ = 0;
+        }
+    }, 1500);
+}
+
+// Called by handleIntent when user triple-taps on CONFIRM_TARGET
+// Cycles to next crossing if multiple found nearby
+function tryNextCrossing() {
+    if (nearbyCrossings.length <= 1) {
+        speak('No other crossings found nearby. Scanning again.');
+        transitionTo(STATES.RESOLVING);
+        setTimeout(resolveJunction, 1000);
+        return;
+    }
+
+    selectedCrossingIndex = (selectedCrossingIndex + 1) % nearbyCrossings.length;
+    announceCurrentCrossing();
 }
 
 function calculateBearing(lat1, lng1, lat2, lng2) {
@@ -370,6 +454,16 @@ function headingDifference(a, b) {
     return diff > 180 ? 360 - diff : diff;
 }
 
+function haversineMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+              Math.sin(dLng/2) * Math.sin(dLng/2);
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
 // ============================================================
 // Haptic commands -- sent back to ESP32
 // ============================================================
@@ -384,8 +478,22 @@ window.navassist.sendHapticLeft  = () => sendHaptic('left',  'pulse');
 window.navassist.sendHapticRight = () => sendHaptic('right', 'pulse');
 window.navassist.sendHapticBoth  = () => sendHaptic('both',  'pulse', 1.0, 500);
 
-// Called by ai.js when it determines the navigation direction
-window.navassist.onDirectionDecided = function(direction) {
+// Called by ai.js when it first detects a traffic light post
+// Used in camera-only mode (no GPS) to trigger confirmation
+window.navassist.onTrafficLightVisible = function(confidence) {
+    if (currentState === STATES.SCANNING) {
+        const message =
+            'Traffic light post detected. ' +
+            'Double tap to confirm this is your crossing, triple tap to keep scanning.';
+        transitionTo(STATES.TARGET_DETECTED);
+        setTimeout(() => {
+            if (currentState === STATES.TARGET_DETECTED) {
+                transitionTo(STATES.CONFIRM_TARGET, message);
+                cumulativeGyroZ = 0;
+            }
+        }, 1500);
+    }
+};
     if (currentState !== STATES.NAVIGATING) return;
     if (direction === 'LEFT')   sendHaptic('left',  'pulse');
     if (direction === 'RIGHT')  sendHaptic('right', 'pulse');
@@ -517,8 +625,8 @@ function handleIntent(intent) {
             break;
         case 'CONFIRM_NO':
             if (currentState === STATES.CONFIRM_TARGET) {
-                transitionTo(STATES.RESOLVING, 'Trying again. Please face the crossing you want.');
-                setTimeout(resolveJunction, 1000);
+                // Try next crossing if multiple found, else rescan
+                tryNextCrossing();
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 transitionTo(STATES.WAITING, 'Understood. Continuing to wait for green man.');
             }
