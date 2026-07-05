@@ -25,3 +25,14 @@ ESP32 Firmware code will be based on this circuit diagram
 - Fires actual left/right motors based on haptic commands from server
 - Startup confirmation buzz on both motors when WebSocket connects
 
+## Notes on circuit diagram:
+### For the ULN2003A
+
+- pins connected: Pin 1, 2, 8, 9, 16.
+- Pin 1 is connected to GPIO 12 pin of ESP32 CAM MODULE OV5640
+- Pin 2 is connected to GPIO 13 pin of ESP32 CAM MODULE OV5640
+- Pin 8 is connected to GND pin of ESP32 CAM MODULE OV5640
+- pin 16 is connected to haptic motor 1 to negative side
+- pin 15 is connected to haptic motor 2 on negative side
+- pin 9 is connected to the 3.3V pin on ESP32 CAM MODULE 0V5640 which I think is also connected to the flipswitch that can control powersupply from the lipo battery.
+- haptic motor 1 and 2 positive sides are connected as one connection end to end.
