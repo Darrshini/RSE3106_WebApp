@@ -144,8 +144,12 @@ function speak(text) {
 }
 
 // ============================================================
-// Server info
+// Bootstrap
 // ============================================================
+
+const settings = loadSettings();
+applySettings(settings);
+loadServerInfo();
 
 async function loadServerInfo() {
     try {
@@ -160,9 +164,26 @@ async function loadServerInfo() {
 }
 
 // ============================================================
-// Bootstrap
+// Back button -- returns to correct page based on where user came from
 // ============================================================
 
-const settings = loadSettings();
-applySettings(settings);
-loadServerInfo();
+const backButton = document.getElementById('backButton');
+if (backButton) {
+    backButton.addEventListener('click', (e) => {
+        e.preventDefault();
+        speak('Going back.', true);
+        // Always go back to index -- the page itself handles
+        // whether to show splash or main app based on referrer
+        setTimeout(() => {
+            window.location.href = 'index.html';
+        }, 400); // slight delay so "going back" speech starts
+    });
+}
+
+// ============================================================
+// Announce settings page on load
+// ============================================================
+
+setTimeout(() => {
+    speak('Settings. Adjust haptic intensity, audio volume, speech rate, and display options. Go back when done.', false);
+}, 300);

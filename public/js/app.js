@@ -661,8 +661,31 @@ window.addEventListener('load', async () => {
     const mainApp = document.getElementById('mainApp');
     const splashButton = document.getElementById('splashButton');
 
-    splashButton.addEventListener('click', () => {
-        // This tap unlocks browser audio -- everything after can play sound
+    // Check if we just came back from settings
+    const cameFromSettings = document.referrer.includes('settings.html');
+
+    if (splashScreen) {
+        // Announce the splash page -- user needs to know where they are
+        setTimeout(() => {
+            if (cameFromSettings) {
+                speak('NavAssist. Settings saved. Tap anywhere to start.', false);
+            } else {
+                speak('NavAssist. Assistive navigation for pedestrian crossings. Tap anywhere to start.', false);
+            }
+        }, 500);
+
+        // Tap anywhere on splash to start (except settings link)
+        splashButton.addEventListener('click', startApp);
+        document.addEventListener('touchstart', (e) => {
+            if (e.target.closest('.splash-settings-link')) return;
+            if (splashScreen && !splashScreen.classList.contains('hidden')) {
+                startApp();
+            }
+        }, { passive: true });
+    }
+
+    function startApp() {
+        // This tap unlocks browser audio for everything that follows
         splashScreen.classList.add('hidden');
         mainApp.classList.remove('hidden');
 
@@ -671,11 +694,7 @@ window.addEventListener('load', async () => {
         initPhoneCompass();
         updateUI(STATES.IDLE);
 
-        // Clear announcement of current state
-        speak(
-            'NavAssist started. Waiting for glasses to connect. ' +
-            'Please ensure your glasses are powered on and connected to WiFi.',
-            false
-        );
-    });
+        // Announce the new state clearly
+        speak('Waiting for glasses to connect. Please ensure your glasses are powered on and connected to WiFi.', false);
+    }
 });
