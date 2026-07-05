@@ -1,6 +1,6 @@
 Work in progress..., welp will try to finish by tuesday ;-;
 This branch will not be merged since its just code to flash into ESP32.
-This is not final code, since i need to integrate this code with Zhen Ye's one that he flashed on his ESP32.
+This is not final code, since i need to integrate this code that communicates with the webapp with Zhen Ye's one that he flashed on his ESP32.
 
 
 Circuit diagram from Neo Zhen Ye:
@@ -36,3 +36,7 @@ ESP32 Firmware code will be based on this circuit diagram
 - pin 15 is connected to haptic motor 2 on negative side
 - pin 9 is connected to the 3.3V pin on ESP32 CAM MODULE 0V5640 which I think is also connected to the flipswitch that can control powersupply from the lipo battery.
 - haptic motor 1 and 2 positive sides are connected as one connection end to end.
+
+### For MPU 6050
+- SDA pin connected to GPIO 14 of ESP32 CAM module
+- SCL pin connected to GPIO 15 of ESP32 CAM module
