@@ -4,6 +4,8 @@ This is not final code, since i need to integrate this code that communicates wi
 
 
 Circuit diagram from Neo Zhen Ye:
+
+
 <img width="578" height="551" alt="image" src="https://github.com/user-attachments/assets/76a95467-8b8a-42d4-94d2-8d7de51ca659" />
 
 
