@@ -1,23 +1,24 @@
 /**
  * NavAssist — ai.js
- * OWNER: Kim Hyeonghu
+ * OWNER: Kim Hyeonghu (adapted: ESP32 camera frames instead of laptop webcam)
  *
  * Camera processing + AI inference + direction logic.
  *
- * This version runs a locally-trained YOLO11 pedestrian-traffic-light model
- * (red / green / traffic-light) fully in the browser via onnxruntime-web,
- * using the LAPTOP WEBCAM as the video source (replaces the ESP32 camera and
- * the Roboflow cloud API).
+ * Runs a locally-trained YOLO11 pedestrian-traffic-light model
+ * (red / green / traffic-light) fully in the browser via onnxruntime-web.
+ * Video source is the ESP32 glasses camera, delivered as base64 JPEG
+ * frames over the WebSocket relay (topic 'camera/image'), NOT the
+ * laptop/phone's own webcam.
  *
- * What it does:
- *   1. Opens the laptop webcam into the <video id="camVideo"> element.
- *   2. Loads models/pedestrian.onnx and runs detection on video frames.
- *   3. Draws bounding boxes on the <canvas id="camOverlay"> overlay.
- *   4. When a GREEN pedestrian light is detected, draws a DIRECTION VECTOR
- *      (arrow) from the bottom-centre of the frame (the user) toward the light,
- *      plus a LEFT / CENTRE / RIGHT label, and speaks the guidance.
- *   5. Still calls the window.navassist.* FSM callbacks from app.js so the
- *      existing audio/state machine keeps working.
+ * Flow:
+ *   1. app.js calls handleCameraFrame(payload) every time a 'camera/image'
+ *      message arrives from the ESP32.
+ *   2. Each frame is decoded into an Image, drawn onto the #camFrame canvas,
+ *      and fed into the YOLO model (throttled to INFER_EVERY_MS).
+ *   3. Detections are drawn on the #camOverlay canvas: bounding boxes,
+ *      a direction arrow to the strongest GREEN light, and a status HUD.
+ *   4. FSM callbacks (window.navassist.*) drive app.js's state machine and
+ *      audio announcements.
  *
  * `ort` (onnxruntime-web) is loaded globally by a <script> tag in index.html.
  */
@@ -31,25 +32,26 @@ const CLASS_COLOR = { red: '#ff1744', green: '#00c853', 'traffic-light': '#2979f
 const INPUT_SIZE  = 640;      // model input (letterboxed square)
 const CONF_THRESH = 0.35;     // detection confidence threshold
 const IOU_THRESH  = 0.45;     // NMS IoU threshold
-const INFER_EVERY_MS = 180;   // throttle inference (video still renders every frame)
+const INFER_EVERY_MS = 180;   // throttle inference (frames may arrive faster than this)
 const GREEN_SPEAK_COOLDOWN_MS = 4000;
 
 // ============================================================
 // State
 // ============================================================
 let session = null;
-let video, overlay, octx;
+let frameCanvas, overlay, frameCtx, octx;
 let preCanvas, preCtx;        // offscreen canvas for letterbox pre-processing
 let latestDetections = [];
+let latestFrameImg = null;    // most recent decoded ESP32 frame (Image element)
 let started = false;
 let modelStatus = 'idle';
 let lastGreenSpeakAt = 0;
+let lastInferAt = 0;
 let fps = 0, lastFrameTs = 0;
 
 // onnxruntime-web: fetch the wasm binaries from the CDN
 if (window.ort) {
     ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-    // numThreads>1 needs cross-origin isolation; keep it robust on plain localhost
     ort.env.wasm.numThreads = 1;
 }
 
@@ -59,11 +61,9 @@ if (window.ort) {
 window.navassist = window.navassist || {};
 window.navassist.startCameraAI = startCameraAI;
 
-// Kept for compatibility with app.js's ESP32 path (unused with the webcam).
-function handleCameraFrame() { /* no-op: webcam drives detection directly */ }
-
-// Start on the first user gesture (needed for getUserMedia). app.js hides the
-// splash and shows the main app on the same tap.
+// Kick off model loading on the first user gesture (keeps behaviour consistent
+// with the splash-tap pattern the rest of the app uses; no getUserMedia needed
+// anymore, but this still cleanly ties "start" to a tap).
 window.addEventListener('load', () => {
     const splashBtn = document.getElementById('splashButton');
     const splash    = document.getElementById('splashScreen');
@@ -73,29 +73,21 @@ window.addEventListener('load', () => {
 });
 
 // ============================================================
-// Camera + model bootstrap
+// Model bootstrap (no camera acquisition here — frames come from ESP32)
 // ============================================================
 async function startCameraAI() {
     if (started) return;
     started = true;
 
-    video   = document.getElementById('camVideo');
-    overlay = document.getElementById('camOverlay');
-    if (!video || !overlay) { started = false; return; }
-    octx = overlay.getContext('2d');
+    frameCanvas = document.getElementById('camFrame');
+    overlay     = document.getElementById('camOverlay');
+    if (!frameCanvas || !overlay) { started = false; return; }
+    frameCtx = frameCanvas.getContext('2d');
+    octx     = overlay.getContext('2d');
 
     preCanvas = document.createElement('canvas');
     preCanvas.width = preCanvas.height = INPUT_SIZE;
     preCtx = preCanvas.getContext('2d', { willReadFrequently: true });
-
-    try {
-        await startWebcam();
-    } catch (e) {
-        modelStatus = 'camera-error';
-        setContext('Camera access failed: ' + e.message + '. Allow camera permission and reload.');
-        window.navassist.debugLog && window.navassist.debugLog('getUserMedia error: ' + e.message);
-        return;
-    }
 
     modelStatus = 'loading-model';
     setContext('Loading detection model…');
@@ -104,71 +96,79 @@ async function startCameraAI() {
             executionProviders: ['wasm'],
             graphOptimizationLevel: 'all'
         });
-        modelStatus = 'ready';
-        setContext('Point the camera at a pedestrian light.');
+        modelStatus = 'waiting-esp32';
+        setContext('Model ready. Waiting for glasses camera feed…');
         window.navassist.debugLog && window.navassist.debugLog(
             'Model loaded. in=' + session.inputNames + ' out=' + session.outputNames);
     } catch (e) {
         modelStatus = 'model-error';
         setContext('Model failed to load (' + e.message + '). Is models/pedestrian.onnx present?');
         window.navassist.debugLog && window.navassist.debugLog('Model load error: ' + e.message);
+        return;
     }
 
     requestAnimationFrame(renderLoop);   // draw overlay every frame (smooth)
-    detectLoop();                        // run inference on a throttled cadence
-}
-
-async function startWebcam() {
-    const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false
-    });
-    video.srcObject = stream;
-    await video.play();
-    // Match overlay resolution to the actual video frame size, and set the
-    // container's aspect ratio so the video and overlay line up exactly.
-    const sync = () => {
-        overlay.width = video.videoWidth;
-        overlay.height = video.videoHeight;
-        const cv = overlay.parentElement;
-        if (cv && video.videoWidth) cv.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
-    };
-    if (video.videoWidth) sync(); else video.addEventListener('loadedmetadata', sync, { once: true });
 }
 
 // ============================================================
-// Inference loop (throttled)
+// ESP32 frame ingestion — called by app.js on every 'camera/image' message
 // ============================================================
-async function detectLoop() {
-    while (started) {
-        const t0 = performance.now();
-        if (session && video.readyState >= 2 && video.videoWidth) {
-            try {
-                const pre = preprocess();
-                const feeds = {}; feeds[session.inputNames[0]] = pre.tensor;
-                const results = await session.run(feeds);
-                const out = results[session.outputNames[0]];
-                latestDetections = postprocess(out, pre);
-                handleGuidance(latestDetections);
-            } catch (e) {
-                window.navassist.debugLog && window.navassist.debugLog('Inference error: ' + e.message);
-            }
+function handleCameraFrame(payload) {
+    // Payload is base64 JPEG per README. Handle both a raw string and an
+    // object wrapper until the exact firmware shape is confirmed.
+    const b64 = typeof payload === 'string' ? payload : (payload.image || payload.data || payload.frame);
+    if (!b64) return;
+
+    const img = new Image();
+    img.onload = () => {
+        if (frameCanvas.width !== img.width || frameCanvas.height !== img.height) {
+            frameCanvas.width = overlay.width = img.width;
+            frameCanvas.height = overlay.height = img.height;
+            const cv = overlay.parentElement;
+            if (cv && img.width) cv.style.aspectRatio = img.width + ' / ' + img.height;
         }
-        const elapsed = performance.now() - t0;
-        await sleep(Math.max(0, INFER_EVERY_MS - elapsed));
+        frameCtx.drawImage(img, 0, 0);
+        latestFrameImg = img;
+        if (modelStatus === 'waiting-esp32') modelStatus = 'ready';
+        maybeRunInference();
+    };
+    img.onerror = () => {
+        window.navassist.debugLog && window.navassist.debugLog('Bad frame: failed to decode JPEG');
+    };
+    img.src = 'data:image/jpeg;base64,' + b64;
+}
+
+// ============================================================
+// Inference (throttled, triggered per incoming frame)
+// ============================================================
+async function maybeRunInference() {
+    if (!session || !latestFrameImg) return;
+    const now = performance.now();
+    if (now - lastInferAt < INFER_EVERY_MS) return;
+    lastInferAt = now;
+
+    try {
+        const pre = preprocess();
+        const feeds = {}; feeds[session.inputNames[0]] = pre.tensor;
+        const results = await session.run(feeds);
+        const out = results[session.outputNames[0]];
+        latestDetections = postprocess(out, pre);
+        handleGuidance(latestDetections);
+    } catch (e) {
+        window.navassist.debugLog && window.navassist.debugLog('Inference error: ' + e.message);
     }
 }
 
-// Letterbox the current video frame into a 640x640 CHW float tensor.
+// Letterbox the current ESP32 frame into a 640x640 CHW float tensor.
 function preprocess() {
-    const iw = video.videoWidth, ih = video.videoHeight, S = INPUT_SIZE;
+    const iw = latestFrameImg.width, ih = latestFrameImg.height, S = INPUT_SIZE;
     const scale = Math.min(S / iw, S / ih);
     const nw = Math.round(iw * scale), nh = Math.round(ih * scale);
     const padX = Math.floor((S - nw) / 2), padY = Math.floor((S - nh) / 2);
 
     preCtx.fillStyle = 'rgb(114,114,114)';
     preCtx.fillRect(0, 0, S, S);
-    preCtx.drawImage(video, padX, padY, nw, nh);
+    preCtx.drawImage(latestFrameImg, padX, padY, nw, nh);
 
     const rgba = preCtx.getImageData(0, 0, S, S).data;
     const area = S * S;
@@ -290,15 +290,12 @@ function drawArrow(x1, y1, x2, y2, color, W) {
     octx.strokeStyle = color; octx.fillStyle = color;
     octx.lineWidth = Math.max(4, W * 0.008);
     octx.lineCap = 'round';
-    // shaft
     octx.beginPath(); octx.moveTo(x1, y1); octx.lineTo(x2, y2); octx.stroke();
-    // head
     octx.beginPath();
     octx.moveTo(x2, y2);
     octx.lineTo(x2 - head * Math.cos(ang - Math.PI / 6), y2 - head * Math.sin(ang - Math.PI / 6));
     octx.lineTo(x2 - head * Math.cos(ang + Math.PI / 6), y2 - head * Math.sin(ang + Math.PI / 6));
     octx.closePath(); octx.fill();
-    // origin dot
     octx.beginPath(); octx.arc(x1, y1, Math.max(5, W * 0.01), 0, Math.PI * 2); octx.fill();
 }
 
@@ -324,22 +321,48 @@ function roundRect(x, y, w, h, r) {
 }
 
 // ============================================================
-// Guidance: direction, light-state, and FSM callbacks
+// Guidance: post detection, direction, light-state, FSM callbacks
 // ============================================================
 function handleGuidance(dets) {
     if (!dets.length) return;
 
-    // NEW: announce spotting the traffic-light post itself (moves SCANNING -> CONFIRM_TARGET)
+    const frameW = overlay.width || 1;
+
+    // Announce spotting the traffic-light post(s). Only meaningful while
+    // SCANNING — app.js's onTrafficLightVisible guards on that state too,
+    // so this is safe to call on every frame without extra cooldown logic;
+    // once it transitions away from SCANNING, this block stops firing.
     const posts = dets.filter(d => CLASSES[d.cls] === 'traffic-light');
     if (posts.length &&
         window.navassist.currentState &&
         window.navassist.currentState() === window.navassist.STATES.SCANNING) {
+
+        if (posts.length > 1) {
+            // Multiple posts in frame — disambiguate by direction so the
+            // user knows there's more than one option, not just "a post".
+            const dirs = posts
+                .map(p => getDirection(((p.x1 + p.x2) / 2) / frameW))
+                .filter((v, i, arr) => arr.indexOf(v) === i); // unique, order-preserving
+            const desc = dirs.length > 1
+                ? `Multiple traffic light posts detected: ${dirs.join(' and ').toLowerCase()}.`
+                : `Traffic light posts detected to your ${dirs[0].toLowerCase()}.`;
+            window.navassist.speak && window.navassist.speak(desc);
+        } else {
+            const dir = getDirection(((posts[0].x1 + posts[0].x2) / 2) / frameW);
+            if (dir !== 'CENTRE') {
+                window.navassist.speak && window.navassist.speak(
+                    `Traffic light post detected to your ${dir.toLowerCase()}.`);
+            }
+            // dir === 'CENTRE' is left unannounced here — app.js's own
+            // "Traffic light post detected" message (fired below) already
+            // covers the straight-ahead case without sounding redundant.
+        }
+
         const post = posts.reduce((a, b) => (a.score > b.score ? a : b));
-        window.navassist.onTrafficLightVisible && window.navassist.onTrafficLightVisible(post.score)
-        
+        window.navassist.onTrafficLightVisible && window.navassist.onTrafficLightVisible(post.score);
+    }
+
     const best = dets.reduce((a, b) => (a.score > b.score ? a : b));
-    const name = CLASSES[best.cls];
-    const frameW = overlay.width || 1;
     const cx = (best.x1 + best.x2) / 2;
     const direction = getDirection(cx / frameW);
 
@@ -353,11 +376,9 @@ function handleGuidance(dets) {
             window.navassist.speak && window.navassist.speak(
                 gdir === 'CENTRE' ? 'Green man ahead. You may cross.' : `Green man to your ${gdir.toLowerCase()}.`);
         }
-        // Keep the existing FSM happy if it is in the WAITING state.
         window.navassist.onGreenDetected && window.navassist.onGreenDetected();
     }
 
-    // Feed direction / arrival into the FSM (used when navigating).
     const boxH = (best.y2 - best.y1) / (overlay.height || 1);
     if (window.navassist.currentState && window.navassist.currentState() === window.navassist.STATES.NAVIGATING) {
         if (boxH > 0.4) window.navassist.onArrived && window.navassist.onArrived();
@@ -374,8 +395,6 @@ function getDirection(normX) {
 // ============================================================
 // Helpers
 // ============================================================
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 function setContext(text) {
     const el = document.getElementById('contextMessage');
     if (el) el.textContent = text;
