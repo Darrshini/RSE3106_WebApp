@@ -3,7 +3,7 @@
 Assistive navigation web app for visually impaired users — RSE3106 James Dyson Award Submission
 
 The instructions below is to setup the app locally on your pc or laptop if you want to.
-I have hosted the webapp on an AWS instance, you can access it through this link: [Web app prototype]([http://3.25.34.34:3000](https://rse3106.duckdns.org/)) 
+I have hosted the webapp on an AWS instance, you can access it through this link: [Web app prototype]([https://rse3106.duckdns.org/) 
 
 I have chnaged it to HTTPS, however you will get a warning sign its unsecure but it is normal because I used a self signed certificate , but it should work fine, just click 
 **Advanced > Continue to Site**
