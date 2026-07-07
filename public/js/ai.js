@@ -328,6 +328,15 @@ function roundRect(x, y, w, h, r) {
 // ============================================================
 function handleGuidance(dets) {
     if (!dets.length) return;
+
+    // NEW: announce spotting the traffic-light post itself (moves SCANNING -> CONFIRM_TARGET)
+    const posts = dets.filter(d => CLASSES[d.cls] === 'traffic-light');
+    if (posts.length &&
+        window.navassist.currentState &&
+        window.navassist.currentState() === window.navassist.STATES.SCANNING) {
+        const post = posts.reduce((a, b) => (a.score > b.score ? a : b));
+        window.navassist.onTrafficLightVisible && window.navassist.onTrafficLightVisible(post.score)
+        
     const best = dets.reduce((a, b) => (a.score > b.score ? a : b));
     const name = CLASSES[best.cls];
     const frameW = overlay.width || 1;
