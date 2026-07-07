@@ -168,12 +168,42 @@ body.high-contrast .context-message {
 /* ============ MAIN CONTENT ============ */
 .main-content {
     display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
+    align-items: center; justify-content: flex-start;
     flex: 1;
-    padding: 24px; gap: 28px;
-    /* Leave room for debug panel when visible */
-    padding-bottom: 24px;
+    padding: 14px; gap: 14px;
+    overflow-y: auto;
 }
+
+/* ============ CAMERA VIEW (webcam + detection overlay) ============ */
+.camera-view {
+    position: relative;
+    width: 100%;
+    max-width: 760px;
+    aspect-ratio: 4 / 3;         /* overridden in ai.js to the real camera ratio */
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.camera-view video,
+.camera-view canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.camera-view video  { object-fit: cover; }
+.camera-view canvas { pointer-events: none; }
+
+.controls-row { display: flex; justify-content: center; flex-shrink: 0; }
+
+.main-button--compact { width: 96px; height: 96px; }
+.main-button--compact .button-icon  { font-size: 30px; }
+.main-button--compact .button-label { font-size: 11px; }
 
 .context-message {
     font-size: 20px; color: var(--text-secondary);
