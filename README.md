@@ -8,6 +8,8 @@ I have hosted the webapp on an AWS instance, you can access it through this link
 I have chnaged it to HTTPS, however you will get a warning sign its unsecure but it is normal because I used a self signed certificate , but it should work fine, just click 
 **Advanced > Continue to Site**
 
+I needed to change from HTTP to HTTPS because in HTTP, GPS and AI models will not work
+
 ## Team 7
 
 | Member | File | Responsibility |
