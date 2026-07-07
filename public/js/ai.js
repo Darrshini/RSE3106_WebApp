@@ -34,6 +34,7 @@ const CONF_THRESH = 0.35;     // detection confidence threshold
 const IOU_THRESH  = 0.45;     // NMS IoU threshold
 const INFER_EVERY_MS = 180;   // throttle inference (frames may arrive faster than this)
 const GREEN_SPEAK_COOLDOWN_MS = 4000;
+const RED_SPEAK_COOLDOWN_MS = 6000;   // less frequent than green -- it's a "keep waiting" reminder, not new info
 
 // ============================================================
 // State
@@ -46,6 +47,7 @@ let latestFrameImg = null;    // most recent decoded ESP32 frame (Image element)
 let started = false;
 let modelStatus = 'idle';
 let lastGreenSpeakAt = 0;
+let lastRedSpeakAt = 0;
 let lastInferAt = 0;
 let fps = 0, lastFrameTs = 0;
 
@@ -377,6 +379,21 @@ function handleGuidance(dets) {
                 gdir === 'CENTRE' ? 'Green man ahead. You may cross.' : `Green man to your ${gdir.toLowerCase()}.`);
         }
         window.navassist.onGreenDetected && window.navassist.onGreenDetected();
+    }
+
+    // Red man: only relevant while WAITING (i.e. user already confirmed a
+    // crossing and is standing there). Reassures periodically rather than
+    // every frame -- this is a "still waiting" reminder, not new information,
+    // and onGreenDetected() above is what actually ends the wait.
+    const reds = dets.filter(d => CLASSES[d.cls] === 'red');
+    if (reds.length &&
+        window.navassist.currentState &&
+        window.navassist.currentState() === window.navassist.STATES.WAITING) {
+        const now = Date.now();
+        if (now - lastRedSpeakAt > RED_SPEAK_COOLDOWN_MS) {
+            lastRedSpeakAt = now;
+            window.navassist.speak && window.navassist.speak('Still red. Please continue to wait.');
+        }
     }
 
     const boxH = (best.y2 - best.y1) / (overlay.height || 1);
