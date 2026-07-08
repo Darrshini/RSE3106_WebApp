@@ -164,6 +164,20 @@ let cumulativeGyroZ = 0;
 let lastGyroTime = Date.now();
 const SIGNIFICANT_TURN_DEG = 45;
 
+// Crossing drift correction
+let crossingStartHeading = null;
+let lastCrossingHapticAt = 0;
+const CROSSING_DRIFT_THRESHOLD_DEG = 20;   // how far off-line before nudging
+const CROSSING_HAPTIC_COOLDOWN_MS = 1500;  // avoid buzzing every IMU sample
+
+// Signed shortest-path angle difference, handles 0/360 wraparound correctly
+function angleDiffDeg(a, b) {
+    let diff = a - b;
+    while (diff > 180) diff -= 360;
+    while (diff < -180) diff += 360;
+    return diff;
+}
+
 function initPhoneCompass() {
     if (typeof DeviceOrientationEvent === 'undefined') return;
 
@@ -208,6 +222,24 @@ function handleImuReading(payload) {
             speak('You have turned away. Follow the haptic feedback to re-orient toward the crossing.');
         }
         cumulativeGyroZ = 0;
+    }
+
+    // Crossing drift correction: nudge the user back toward a straight line
+    // if their heading drifts too far from the heading captured the moment
+    // they started crossing. NOTE: verify the sign below (which motor fires
+    // for which drift direction) against the real ESP32 heading_deg
+    // convention and motor wiring -- this assumes compass-style clockwise
+    // degrees, where a positive drift means the user turned right and needs
+    // a left-nudge to correct back.
+    if (currentState === STATES.CROSSING && crossingStartHeading !== null) {
+        const drift = angleDiffDeg(currentHeading, crossingStartHeading);
+        const nowMs = Date.now();
+        if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG &&
+            nowMs - lastCrossingHapticAt > CROSSING_HAPTIC_COOLDOWN_MS) {
+            lastCrossingHapticAt = nowMs;
+            if (drift > 0) sendHaptic('left', 'pulse', 0.6, 250);
+            else            sendHaptic('right', 'pulse', 0.6, 250);
+        }
     }
 
     debugLog('IMU: heading=' + currentHeading.toFixed(1) + '° gyroZ=' + gyroZ.toFixed(1));
@@ -503,9 +535,11 @@ function handleIntent(intent) {
             if (currentState === STATES.CONFIRM_TARGET) {
                 transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
             } else if (currentState === STATES.CONFIRM_CROSSING) {
+                crossingStartHeading = currentHeading;
                 transitionTo(STATES.CROSSING, 'Cross now. Walk straight ahead.');
                 setTimeout(() => {
                     if (currentState === STATES.CROSSING) {
+                        crossingStartHeading = null;
                         transitionTo(STATES.COMPLETED, 'Crossing complete. Tap once to scan again.');
                     }
                 }, 15000);
