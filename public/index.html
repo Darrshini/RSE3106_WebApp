@@ -39,14 +39,17 @@
 
         <!-- Main content -->
         <main class="main-content">
-            <!-- Live webcam feed + detection/vector overlay -->
+            <!-- ESP32 glasses camera feed + detection/vector overlay -->
+            <!-- camFrame draws each incoming JPEG frame from the ESP32; camOverlay
+                 draws bounding boxes / direction arrow on top of it. No <video>
+                 here -- there's no MediaStream, frames arrive over WebSocket. -->
             <div class="camera-view">
-                <video id="camVideo" playsinline muted autoplay></video>
+                <canvas id="camFrame"></canvas>
                 <canvas id="camOverlay"></canvas>
             </div>
 
             <div id="contextMessage" class="context-message" aria-live="polite">
-                Tap to start the camera.
+                Waiting for glasses camera feed…
             </div>
 
             <div class="controls-row">
