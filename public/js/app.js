@@ -404,7 +404,10 @@ window.navassist.onArrived = function() {
         transitionTo(STATES.REACHED, 'You have reached the crossing. Please wait.');
         setTimeout(() => {
             if (currentState === STATES.REACHED) {
-                transitionTo(STATES.WAITING, 'Red man. Please wait for the green signal.');
+                // Neutral message here -- we don't yet know the actual light
+                // color. ai.js's red/green detection (handleGuidance) speaks
+                // the real state within moments of entering WAITING.
+                transitionTo(STATES.WAITING, 'Checking the signal…');
             }
         }, 2000);
     }
@@ -587,7 +590,7 @@ const STATE_SPEECH = {
     CONFIRM_TARGET:   'Is this the right crossing? Double tap for yes, triple tap to try again.',
     NAVIGATING:       'Confirmed. Follow the haptic feedback toward the crossing.',
     REACHED:          'You have reached the crossing.',
-    WAITING:          'Red man. Please wait.',
+    WAITING:          'Checking the signal…',
     CONFIRM_CROSSING: 'Green man. You may cross. Double tap to confirm.',
     CROSSING:         'Cross now. Walk straight ahead.',
     COMPLETED:        'Crossing complete. Well done. Tap once to scan again.',
