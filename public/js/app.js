@@ -69,7 +69,7 @@ const GESTURE_RULES = {
 // ============================================================
 
 let ws = null;
-const WS_URL = 'ws://' + location.host + '/browser';
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/browser';
 
 function connectWebSocket() {
     ws = new WebSocket(WS_URL);
