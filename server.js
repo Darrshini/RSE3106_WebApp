@@ -63,7 +63,9 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Track connected clients by type
-let browserClient = null;
+// browserClients is a Set (not a single slot) so multiple people can view
+// the live feed simultaneously -- every message gets broadcast to all of them.
+let browserClients = new Set();
 let esp32Client = null;
 
 wss.on('connection', (ws, req) => {
@@ -76,17 +78,20 @@ wss.on('connection', (ws, req) => {
     // Browser connects to /browser
     // ESP32 connects to /esp32
     if (url === '/browser') {
-        browserClient = ws;
-        console.log('[WS] Browser connected');
+        browserClients.add(ws);
+        console.log(`[WS] Browser connected (${browserClients.size} total viewer(s))`);
 
-        // Tell browser the current ESP32 connection status
-        sendToBrowser({
+        // Tell THIS newly-connected browser the current ESP32 status --
+        // sent directly to it, not broadcast, so other already-connected
+        // viewers don't get a redundant duplicate status message.
+        const statusMsg = JSON.stringify({
             topic: 'connection/event',
             timestamp: Date.now(),
             payload: {
                 event: esp32Client ? 'esp32_connected' : 'esp32_disconnected'
             }
         });
+        if (ws.readyState === 1) ws.send(statusMsg);
 
         ws.on('message', (data) => {
             // Browser → ESP32 (e.g. haptic commands)
@@ -100,8 +105,8 @@ wss.on('connection', (ws, req) => {
         });
 
         ws.on('close', () => {
-            console.log('[WS] Browser disconnected');
-            browserClient = null;
+            browserClients.delete(ws);
+            console.log(`[WS] Browser disconnected (${browserClients.size} remaining)`);
         });
 
     } else if (url === '/esp32') {
@@ -151,8 +156,11 @@ wss.on('connection', (ws, req) => {
 // ============================================================
 
 function sendToBrowser(message) {
-    if (browserClient && browserClient.readyState === 1) {
-        browserClient.send(JSON.stringify(message));
+    const data = JSON.stringify(message);
+    for (const client of browserClients) {
+        if (client.readyState === 1) {
+            client.send(data);
+        }
     }
 }
 
