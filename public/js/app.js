@@ -162,15 +162,22 @@ function handleHeartbeat(payload) {
 let currentHeading = 0;
 let imuCalibrated = false;
 let phoneCompassAvailable = false;
-let cumulativeGyroZ = 0;
-let lastGyroTime = Date.now();
 const SIGNIFICANT_TURN_DEG = 45;
 
-// Crossing drift correction
+// Reference headings captured at the start of a phase, compared against the
+// live phone heading to detect drift. Using the phone's own compass as the
+// sole heading source (team decision: no glasses IMU, accept compass noise
+// as a tradeoff for time) -- this replaces the old gyroscope-rate-integration
+// approach, which depended entirely on glasses hardware that no longer sends
+// imu/orientation data at all.
+let navigatingStartHeading = null;
+let lastTurnWarningAt = 0;
+const TURN_WARNING_COOLDOWN_MS = 5000;
+
 let crossingStartHeading = null;
 let lastCrossingHapticAt = 0;
 const CROSSING_DRIFT_THRESHOLD_DEG = 20;   // how far off-line before nudging
-const CROSSING_HAPTIC_COOLDOWN_MS = 1500;  // avoid buzzing every IMU sample
+const CROSSING_HAPTIC_COOLDOWN_MS = 1500;  // avoid buzzing on every reading
 
 // Signed shortest-path angle difference, handles 0/360 wraparound correctly
 function angleDiffDeg(a, b) {
@@ -199,52 +206,57 @@ function initPhoneCompass() {
 }
 
 function handleDeviceOrientation(event) {
-    if (event.alpha !== null) {
-        currentHeading = event.alpha;
-        imuCalibrated = true;
-    }
+    if (event.alpha === null) return;
+    currentHeading = event.alpha;
+    imuCalibrated = true;
+    checkHeadingDrift();
 }
 
-function handleImuReading(payload) {
-    const gyroZ = payload.gyro_z || 0;
-
-    if (!phoneCompassAvailable && payload.heading_deg) {
-        currentHeading = payload.heading_deg;
-        imuCalibrated = payload.calibrated || false;
-    }
-
-    // Track cumulative rotation for turn detection
-    const now = Date.now();
-    const dt = (now - lastGyroTime) / 1000;
-    lastGyroTime = now;
-    cumulativeGyroZ += gyroZ * dt;
-
-    if (Math.abs(cumulativeGyroZ) > SIGNIFICANT_TURN_DEG) {
-        if (currentState === STATES.NAVIGATING) {
+// Runs on every phone compass update. Handles both the "you've turned away"
+// warning during NAVIGATING and the haptic drift-correction during CROSSING
+// -- both compare the live heading against a reference captured at the start
+// of that phase, rather than integrating a rotation rate (which needed a
+// physical gyroscope we no longer have).
+function checkHeadingDrift() {
+    if (currentState === STATES.NAVIGATING && navigatingStartHeading !== null) {
+        const drift = angleDiffDeg(currentHeading, navigatingStartHeading);
+        const now = Date.now();
+        if (Math.abs(drift) > SIGNIFICANT_TURN_DEG && now - lastTurnWarningAt > TURN_WARNING_COOLDOWN_MS) {
+            lastTurnWarningAt = now;
             speak('You have turned away. Follow the haptic feedback to re-orient toward the crossing.');
+            navigatingStartHeading = currentHeading;  // reset reference so this only re-fires after another significant turn
         }
-        cumulativeGyroZ = 0;
     }
 
     // Crossing drift correction: nudge the user back toward a straight line
     // if their heading drifts too far from the heading captured the moment
     // they started crossing. NOTE: verify the sign below (which motor fires
-    // for which drift direction) against the real ESP32 heading_deg
-    // convention and motor wiring -- this assumes compass-style clockwise
-    // degrees, where a positive drift means the user turned right and needs
-    // a left-nudge to correct back.
+    // for which drift direction) against the real motor wiring -- this
+    // assumes compass-style clockwise degrees, where a positive drift means
+    // the user turned right and needs a left-nudge to correct back.
     if (currentState === STATES.CROSSING && crossingStartHeading !== null) {
         const drift = angleDiffDeg(currentHeading, crossingStartHeading);
-        const nowMs = Date.now();
+        const now = Date.now();
         if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG &&
-            nowMs - lastCrossingHapticAt > CROSSING_HAPTIC_COOLDOWN_MS) {
-            lastCrossingHapticAt = nowMs;
+            now - lastCrossingHapticAt > CROSSING_HAPTIC_COOLDOWN_MS) {
+            lastCrossingHapticAt = now;
             if (drift > 0) sendHaptic('left', 'pulse', 0.6, 250);
             else            sendHaptic('right', 'pulse', 0.6, 250);
         }
     }
+}
 
-    debugLog('IMU: heading=' + currentHeading.toFixed(1) + '° gyroZ=' + gyroZ.toFixed(1));
+function handleImuReading(payload) {
+    // Kept for backward compatibility in case a physical IMU is ever added
+    // back later -- currently unused, since heading comes from the phone's
+    // own compass (see handleDeviceOrientation / checkHeadingDrift above).
+    if (!phoneCompassAvailable && payload.heading_deg) {
+        currentHeading = payload.heading_deg;
+        imuCalibrated = payload.calibrated || false;
+        checkHeadingDrift();
+    }
+
+    debugLog('IMU: heading=' + currentHeading.toFixed(1) + '°');
 }
 
 window.navassist = window.navassist || {};
@@ -374,7 +386,6 @@ function announceCurrentCrossing() {
     setTimeout(() => {
         if (currentState === STATES.TARGET_DETECTED) {
             transitionTo(STATES.CONFIRM_TARGET, message);
-            cumulativeGyroZ = 0;
         }
     }, 1500);
 }
@@ -420,7 +431,6 @@ window.navassist.onTrafficLightVisible = function(confidence) {
         setTimeout(() => {
             if (currentState === STATES.TARGET_DETECTED) {
                 transitionTo(STATES.CONFIRM_TARGET, message);
-                cumulativeGyroZ = 0;
             }
         }, 1500);
     }
@@ -451,6 +461,7 @@ window.navassist.onGreenDirection = function(direction) {
 
 window.navassist.onArrived = function() {
     if (currentState === STATES.NAVIGATING) {
+        navigatingStartHeading = null;
         transitionTo(STATES.REACHED, 'You have reached the crossing. Please wait.');
         setTimeout(() => {
             if (currentState === STATES.REACHED) {
@@ -551,6 +562,7 @@ function handleIntent(intent) {
             break;
         case 'CONFIRM_YES':
             if (currentState === STATES.CONFIRM_TARGET) {
+                navigatingStartHeading = currentHeading;
                 transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 crossingStartHeading = currentHeading;
