@@ -150,7 +150,9 @@ function handleHeartbeat(payload) {
     heartbeatTimer = setTimeout(() => {
         debugLog('Heartbeat timeout');
         handleConnectionEvent({ event: 'esp32_disconnected' });
-    }, 6000);
+    }, 15000);   // was 6000; widened so a burst of on-main-thread inference
+                 // (ai.js runs YOLO synchronously on WASM) can't starve the
+                 // heartbeat handler and trip a false disconnect
 }
 
 // ============================================================
@@ -429,6 +431,22 @@ window.navassist.onDirectionDecided = function(direction) {
     if (direction === 'LEFT')   sendHaptic('left',  'pulse');
     if (direction === 'RIGHT')  sendHaptic('right', 'pulse');
     if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.3, 200);
+};
+
+// Directional buzz for a detected green man, regardless of state.
+// Unlike onDirectionDecided (which only runs while NAVIGATING), this fires
+// whenever ai.js sees a green man, so the user feels which side it's on:
+// green on the left -> left motor, right -> right, straight ahead -> both.
+// Cooldown keeps it from buzzing on every inference frame.
+let lastGreenHapticAt = 0;
+const GREEN_HAPTIC_COOLDOWN_MS = 1500;
+window.navassist.onGreenDirection = function(direction) {
+    const now = Date.now();
+    if (now - lastGreenHapticAt < GREEN_HAPTIC_COOLDOWN_MS) return;
+    lastGreenHapticAt = now;
+    if (direction === 'LEFT')   sendHaptic('left',  'pulse', 0.8, 500);
+    if (direction === 'RIGHT')  sendHaptic('right', 'pulse', 0.8, 500);
+    if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.8, 500);
 };
 
 window.navassist.onArrived = function() {

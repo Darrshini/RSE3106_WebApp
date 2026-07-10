@@ -32,7 +32,11 @@ const CLASS_COLOR = { red: '#ff1744', green: '#00c853', 'traffic-light': '#2979f
 const INPUT_SIZE  = 640;      // model input (letterboxed square)
 const CONF_THRESH = 0.35;     // detection confidence threshold
 const IOU_THRESH  = 0.45;     // NMS IoU threshold
-const INFER_EVERY_MS = 180;   // throttle inference (frames may arrive faster than this)
+const INFER_EVERY_MS = 700;   // throttle inference. Each session.run() blocks the
+                              // main thread (WASM, single-threaded), so running it
+                              // too often starves the WebSocket/heartbeat handler and
+                              // trips app.js's disconnect timer. Frames arrive ~1/s
+                              // anyway, so 180ms bought nothing but contention.
 const GREEN_SPEAK_COOLDOWN_MS = 4000;
 const RED_SPEAK_COOLDOWN_MS = 6000;   // less frequent than green -- it's a "keep waiting" reminder, not new info
 
@@ -148,6 +152,14 @@ async function maybeRunInference() {
     const now = performance.now();
     if (now - lastInferAt < INFER_EVERY_MS) return;
     lastInferAt = now;
+
+    // Yield to the event loop before the (main-thread-blocking) inference so
+    // any queued WebSocket messages -- crucially the heartbeat -- get handled
+    // first. Without this, back-to-back inferences can hold the thread long
+    // enough for app.js's disconnect timer to fire even though the socket is
+    // healthy. This does NOT make inference itself non-blocking (that would
+    // need a Web Worker); it just stops it from jumping the queue.
+    await new Promise(resolve => setTimeout(resolve, 0));
 
     try {
         const pre = preprocess();
@@ -370,11 +382,16 @@ function handleGuidance(dets) {
 
     const greens = dets.filter(d => CLASSES[d.cls] === 'green');
     if (greens.length) {
+        const g = greens.reduce((a, b) => (a.score > b.score ? a : b));
+        const gdir = getDirection(((g.x1 + g.x2) / 2) / frameW);
+
+        // Directional haptic: buzz the side the green man is on. Has its own
+        // cooldown inside app.js, so it's safe to call every frame here.
+        window.navassist.onGreenDirection && window.navassist.onGreenDirection(gdir);
+
         const now = Date.now();
         if (now - lastGreenSpeakAt > GREEN_SPEAK_COOLDOWN_MS) {
             lastGreenSpeakAt = now;
-            const g = greens.reduce((a, b) => (a.score > b.score ? a : b));
-            const gdir = getDirection(((g.x1 + g.x2) / 2) / frameW);
             window.navassist.speak && window.navassist.speak(
                 gdir === 'CENTRE' ? 'Green man ahead. You may cross.' : `Green man to your ${gdir.toLowerCase()}.`);
         }
