@@ -150,9 +150,7 @@ function handleHeartbeat(payload) {
     heartbeatTimer = setTimeout(() => {
         debugLog('Heartbeat timeout');
         handleConnectionEvent({ event: 'esp32_disconnected' });
-    }, 15000);   // was 6000; widened so a burst of on-main-thread inference
-                 // (ai.js runs YOLO synchronously on WASM) can't starve the
-                 // heartbeat handler and trip a false disconnect
+    }, 6000);
 }
 
 // ============================================================
@@ -269,6 +267,38 @@ window.navassist.isImuCalibrated = () => imuCalibrated;
 
 let currentLocation = null;
 
+// Crossing completion: track distance moved since CROSSING began, instead of
+// blindly assuming 15 seconds means "made it across". Falls back to a timer
+// only if GPS never gets a usable fix.
+let crossingStartLocation = null;
+let crossingFallbackTimerId = null;
+const CROSSING_DISTANCE_THRESHOLD_M = 8;    // typical minimum pedestrian crossing width
+const CROSSING_MAX_DURATION_MS = 25000;     // safety net if GPS has no fix / poor signal
+
+// Haversine formula: great-circle distance between two lat/lng points in meters
+function distanceMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000; // Earth radius in meters
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLng = (lng2 - lng1) * Math.PI / 180;
+    const a = Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+        Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Called once the user has actually moved far enough, or the fallback timer
+// fires -- whichever happens first. Guards against double-firing.
+function completeCrossing() {
+    if (currentState !== STATES.CROSSING) return;
+    crossingStartHeading = null;
+    crossingStartLocation = null;
+    if (crossingFallbackTimerId) {
+        clearTimeout(crossingFallbackTimerId);
+        crossingFallbackTimerId = null;
+    }
+    transitionTo(STATES.COMPLETED, 'Crossing complete. Tap once to scan again.');
+}
+
 function startGpsTracking() {
     if (location.protocol === 'http:' && location.hostname !== 'localhost') {
         debugLog('GPS blocked on HTTP -- needs HTTPS');
@@ -293,6 +323,17 @@ function startGpsTracking() {
 
             if (currentState === STATES.RESOLVING) {
                 resolveJunction();
+            }
+
+            if (currentState === STATES.CROSSING && crossingStartLocation) {
+                const moved = distanceMeters(
+                    crossingStartLocation.latitude, crossingStartLocation.longitude,
+                    currentLocation.latitude, currentLocation.longitude
+                );
+                debugLog('Crossing distance moved: ' + moved.toFixed(1) + 'm');
+                if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
+                    completeCrossing();
+                }
             }
         },
         (error) => {
@@ -443,22 +484,6 @@ window.navassist.onDirectionDecided = function(direction) {
     if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.3, 200);
 };
 
-// Directional buzz for a detected green man, regardless of state.
-// Unlike onDirectionDecided (which only runs while NAVIGATING), this fires
-// whenever ai.js sees a green man, so the user feels which side it's on:
-// green on the left -> left motor, right -> right, straight ahead -> both.
-// Cooldown keeps it from buzzing on every inference frame.
-let lastGreenHapticAt = 0;
-const GREEN_HAPTIC_COOLDOWN_MS = 1500;
-window.navassist.onGreenDirection = function(direction) {
-    const now = Date.now();
-    if (now - lastGreenHapticAt < GREEN_HAPTIC_COOLDOWN_MS) return;
-    lastGreenHapticAt = now;
-    if (direction === 'LEFT')   sendHaptic('left',  'pulse', 0.8, 500);
-    if (direction === 'RIGHT')  sendHaptic('right', 'pulse', 0.8, 500);
-    if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.8, 500);
-};
-
 window.navassist.onArrived = function() {
     if (currentState === STATES.NAVIGATING) {
         navigatingStartHeading = null;
@@ -566,13 +591,18 @@ function handleIntent(intent) {
                 transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 crossingStartHeading = currentHeading;
+                crossingStartLocation = currentLocation;  // may be null if no GPS fix yet -- handled below
                 transitionTo(STATES.CROSSING, 'Cross now. Walk straight ahead.');
-                setTimeout(() => {
-                    if (currentState === STATES.CROSSING) {
-                        crossingStartHeading = null;
-                        transitionTo(STATES.COMPLETED, 'Crossing complete. Tap once to scan again.');
-                    }
-                }, 15000);
+
+                if (!crossingStartLocation) {
+                    debugLog('No GPS fix at crossing start -- falling back to timer only');
+                }
+                // Safety net: completes the crossing after a fixed duration
+                // regardless of GPS, in case there's no fix, poor signal, or
+                // the user isn't moving in a way GPS can resolve indoors/in
+                // a small test space. If GPS distance completes it first,
+                // this gets cancelled inside completeCrossing().
+                crossingFallbackTimerId = setTimeout(completeCrossing, CROSSING_MAX_DURATION_MS);
             }
             break;
         case 'CONFIRM_NO':
