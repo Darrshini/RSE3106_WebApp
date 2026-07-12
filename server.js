@@ -155,11 +155,44 @@ wss.on('connection', (ws, req) => {
 // Helper functions
 // ============================================================
 
+// Camera frames dropped so far, plus when we last logged -- so we can report
+// drops occasionally instead of flooding the console every frame.
+let droppedCamFrames = 0;
+let lastDropLogAt = 0;
+
 function sendToBrowser(message) {
     const data = JSON.stringify(message);
+    const isCameraFrame = message.topic === 'camera/image';
+
     for (const client of browserClients) {
-        if (client.readyState === 1) {
-            client.send(data);
+        if (client.readyState !== 1) continue;
+
+        // Backpressure-aware frame dropping. WebSocket is reliable + ordered,
+        // so if a browser can't drain frames as fast as the camera produces
+        // them, they don't drop -- they queue in this socket's send buffer and
+        // the on-screen feed falls further and further behind (the lag you see
+        // only once the server is in the loop). bufferedAmount is how many
+        // bytes are still waiting to go out to THIS client. If more than
+        // roughly one whole frame is already queued, skip sending this frame to
+        // that client -- it'd only add latency, and a newer frame is coming.
+        // Only camera frames are dropped; heartbeat / IMU / connection events
+        // are small and important, so they always go through.
+        if (isCameraFrame && client.bufferedAmount > data.length) {
+            droppedCamFrames++;
+            continue;
+        }
+
+        client.send(data);
+    }
+
+    // Occasional summary so it's visible that dropping is happening (and how
+    // much), without logging on every single frame.
+    if (isCameraFrame && droppedCamFrames > 0) {
+        const now = Date.now();
+        if (now - lastDropLogAt > 2000) {
+            console.log(`[WS] Dropped ${droppedCamFrames} stale camera frame(s) in the last ~2s to keep the feed low-latency`);
+            droppedCamFrames = 0;
+            lastDropLogAt = now;
         }
     }
 }
