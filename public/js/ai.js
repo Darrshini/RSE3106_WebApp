@@ -43,7 +43,6 @@ const INFER_EVERY_MS = 150;   // MINIMUM gap between inferences. Inference runs 
                               // that much (plus this floor). If it's high, the fix
                               // is faster inference (WebGPU / smaller model), NOT a
                               // lower floor here.
-const GREEN_SPEAK_COOLDOWN_MS = 4000;
 const RED_SPEAK_COOLDOWN_MS = 6000;   // less frequent than green -- it's a "keep waiting" reminder, not new info
 
 // ============================================================
@@ -60,7 +59,6 @@ let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop g
 let pendingB64 = null;        // newest frame that arrived while a decode was in flight
 let started = false;
 let modelStatus = 'idle';
-let lastGreenSpeakAt = 0;
 let lastRedSpeakAt = 0;
 let lastInferAt = 0;
 let lastInferMs = 0;          // last inference wall-time (ms), for the HUD
@@ -423,13 +421,13 @@ function handleGuidance(dets) {
         // cooldown inside app.js, so it's safe to call every frame here.
         window.navassist.onGreenDirection && window.navassist.onGreenDirection(gdir);
 
-        const now = Date.now();
-        if (now - lastGreenSpeakAt > GREEN_SPEAK_COOLDOWN_MS) {
-            lastGreenSpeakAt = now;
-            window.navassist.speak && window.navassist.speak(
-                gdir === 'CENTRE' ? 'Green man ahead. You may cross.' : `Green man to your ${gdir.toLowerCase()}.`);
-        }
-        window.navassist.onGreenDetected && window.navassist.onGreenDetected();
+        // Speech for "green man detected, you may cross" now lives entirely
+        // in app.js's onGreenDetected -- previously this also spoke here,
+        // causing two overlapping/back-to-back messages for the same event.
+        // Direction is passed through so app.js can build ONE message that
+        // includes both the direction and the "double tap to confirm"
+        // instruction, instead of splitting that across two speak() calls.
+        window.navassist.onGreenDetected && window.navassist.onGreenDetected(gdir);
     }
 
     // Red man: only relevant while WAITING (i.e. user already confirmed a
