@@ -27,7 +27,7 @@
     };
     const S = { WAITING: 'WAITING', CROSSING: 'CROSSING', DONE: 'DONE' };
 
-    let video, overlay, octx, cap, capctx, onStatus;
+    let video, overlay, octx, cap, capctx, maskCanvas, maskCtx, onStatus;
     let running = false, inFlight = false, lastInferAt = 0, latest = null;
     let state = S.WAITING, armed = false, noDash = 0, lastSpeakAt = 0, lastDirWord = '';
 
@@ -44,6 +44,7 @@
         video = videoEl; overlay = overlayEl; onStatus = statusCb;
         octx = overlay.getContext('2d');
         cap = document.createElement('canvas'); capctx = cap.getContext('2d', { willReadFrequently: true });
+        maskCanvas = document.createElement('canvas'); maskCtx = maskCanvas.getContext('2d');
         state = S.WAITING; armed = false; noDash = 0; running = true;
         requestAnimationFrame(draw);
         loop();
@@ -127,8 +128,7 @@
         const W = overlay.width, H = overlay.height, lw = Math.max(2, W * 0.004), fp = Math.max(13, Math.round(W * 0.022));
         octx.clearRect(0, 0, W, H);
 
-        octx.lineWidth = lw; octx.strokeStyle = '#00b0ff';
-        for (const d of r.dotted) { const b = d.box; octx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]); }
+        for (const d of r.dotted) if (d.mask) drawMask(d.mask);   // the model's segmentation, not a box
 
         if (r.light) {
             const b = r.light.box, col = r.light.state === 'GREEN' ? '#00e676' : r.light.state === 'RED' ? '#ff1744' : '#ffab00';
@@ -154,6 +154,22 @@
         const l = latest && latest.light;
         if (l && l.state === 'RED') return '#ff1744';
         return '#555';
+    }
+
+    // Render a dotted-line SEGMENTATION mask: unpack the bit-packed bitmap into a
+    // small canvas, then stretch it (smoothed) onto its box in overlay coords.
+    function drawMask(m) {
+        maskCanvas.width = m.mw; maskCanvas.height = m.mh;
+        const n = m.mw * m.mh, bin = atob(m.data), img = maskCtx.createImageData(m.mw, m.mh), dt = img.data;
+        for (let i = 0; i < n; i++) {
+            if ((bin.charCodeAt(i >> 3) >> (i & 7)) & 1) {
+                const o = i * 4; dt[o] = 0; dt[o + 1] = 224; dt[o + 2] = 255; dt[o + 3] = 125;
+            }
+        }
+        maskCtx.putImageData(img, 0, 0);
+        const b = m.box;
+        octx.imageSmoothingEnabled = true;
+        octx.drawImage(maskCanvas, b[0], b[1], b[2] - b[0], b[3] - b[1]);
     }
 
     function arrow(ctx, a, b, color, W) {

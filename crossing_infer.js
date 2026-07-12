@@ -9,12 +9,13 @@
  *   - per-frame end-of-crossing signals (dashes-ahead + light proximity)
  *
  * The temporal decisions (fresh red->green cross timing, "reached the end")
- * live in the client so the server stays stateless. The crossing DIRECTION comes
- * purely from the segmented dotted lines (output1 masks): each dotted-line run is
- * elongated ALONG the crossing, so its instance-mask principal axis IS the
- * heading toward the far kerb. We never steer toward the pedestrian light — the
- * pedestrian crosses to the opposite kerb, not to the light; the light only
- * serves as a weak agreement check.
+ * live in the client so the server stays stateless. Everything about the dotted
+ * lines is driven by the model's SEGMENTATION MASKS (output1), never their
+ * bounding boxes: we threshold each instance mask, run PCA on its pixels for the
+ * line fit, take the vanishing point of the dashed boundaries as the heading
+ * toward the far kerb, and hand the client the mask bitmap itself to draw. We
+ * never steer toward the pedestrian light — the pedestrian crosses to the
+ * opposite kerb, not the light; the light is only a weak agreement check.
  */
 const ort = require('onnxruntime-node');
 const sharp = require('sharp');
@@ -113,20 +114,31 @@ function lightState(raw, w, h, box) {
     return { state, green, red, lit };
 }
 
-// Principal axis of ONE dotted-line instance from its segmentation mask.
-// mask(px,py) = sigmoid(coeffs . protos); protos (output1) are at 160x160 in the
-// letterboxed frame, so sigmoid(s)>0.5 <=> s>0 (no exp needed for the test).
-// Returns the pixels (in ORIGINAL image coords) plus the covariance eigen-axis
-// and an elongation ratio; a high ratio means it's a genuine line (not a blob).
-function maskAxis(P, det, scale, padX, padY) {
+// ONE dotted-line instance, taken entirely from its SEGMENTATION MASK (not its
+// box). mask(px,py) = sigmoid(coeffs . protos); protos (output1) are at 160x160
+// in the letterboxed frame, so sigmoid(s)>0.5 <=> s>0 (no exp needed). We keep
+// the box only as the window to scan the prototype grid (Ultralytics crops masks
+// to the box anyway). From the thresholded mask pixels we derive: the PCA line
+// axis + elongation (a high ratio = a genuine line, not a blob), the pixel
+// centroid, the lowest mask pixel (mask-based end-of-crossing), and a compact
+// bit-packed bitmap of the mask (+ its box in ORIGINAL coords) for the client to
+// draw the actual segmentation.
+function dottedMask(P, det, scale, padX, padY) {
     const MW = 160, MA = MW * MW, c = det.coeffs;
     const lx1 = det.x1*scale+padX, ly1 = det.y1*scale+padY, lx2 = det.x2*scale+padX, ly2 = det.y2*scale+padY;
     const mx1 = Math.max(0,Math.floor(lx1/4)), my1 = Math.max(0,Math.floor(ly1/4));
     const mx2 = Math.min(MW,Math.ceil(lx2/4)), my2 = Math.min(MW,Math.ceil(ly2/4));
-    const pts = [];
+    const mw = mx2-mx1, mh = my2-my1;
+    if (mw < 1 || mh < 1) return null;
+    const bits = new Uint8Array((mw*mh + 7) >> 3);            // 1 bit per prototype cell, row-major
+    const pts = []; let maxY = -1;
     for (let my=my1; my<my2; my++) for (let mx=mx1; mx<mx2; mx++){
         let s=0; const base=my*MW+mx; for (let k=0;k<32;k++) s += c[k]*P[k*MA+base];
-        if (s>0) pts.push({ x:((mx+0.5)*4-padX)/scale, y:((my+0.5)*4-padY)/scale });   // sigmoid>0.5
+        if (s>0) {                                            // pixel is inside the segmentation mask
+            const idx = (my-my1)*mw + (mx-mx1); bits[idx>>3] |= (1 << (idx&7));
+            const ox=((mx+0.5)*4-padX)/scale, oy=((my+0.5)*4-padY)/scale;   // cell centre -> original
+            pts.push({ x:ox, y:oy }); if (oy>maxY) maxY=oy;
+        }
     }
     if (pts.length < 6) return null;
     let cx=0,cy=0; for(const p of pts){cx+=p.x;cy+=p.y;} cx/=pts.length; cy/=pts.length;
@@ -135,8 +147,11 @@ function maskAxis(P, det, scale, padX, padY) {
     const tr=sxx+syy, D=sxx*syy-sxy*sxy, disc=Math.sqrt(Math.max(0,tr*tr/4-D));
     const l1=tr/2+disc, l2=tr/2-disc;
     const th=0.5*Math.atan2(2*sxy, sxx-syy); let dx=Math.cos(th), dy=Math.sin(th);
-    if (dy>0){ dx=-dx; dy=-dy; }                              // orient each axis toward the far side (up)
-    return { dx, dy, count:pts.length, elong:(l2>1e-6? l1/l2 : 999), pts };
+    if (dy>0){ dx=-dx; dy=-dy; }                              // orient axis toward the far side (up)
+    // client render payload: the mask bitmap + its box in ORIGINAL coords (cell EDGES)
+    const box = [ (mx1*4-padX)/scale, (my1*4-padY)/scale, (mx2*4-padX)/scale, (my2*4-padY)/scale ];
+    return { cx, cy, dx, dy, count:pts.length, elong:(l2>1e-6? l1/l2 : 999), maxY,
+             client: { box, mw, mh, data: Buffer.from(bits).toString('base64') } };
 }
 
 // Crossing DIRECTION from the segmented dotted lines only (never the light).
@@ -151,16 +166,8 @@ function maskAxis(P, det, scale, padX, padY) {
 // only a weak sanity flag.
 function median(arr){ const s=[...arr].sort((a,b)=>a-b); return s[(s.length-1)>>1]; }
 
-function corridor(dotted, P, scale, padX, padY, light, w, h) {
-    const lines = [];
-    for (const det of dotted) {
-        const m = maskAxis(P, det, scale, padX, padY);
-        if (!m || m.count < 8 || m.elong < 2.0) continue;    // must be a genuine line segment
-        let cx=0, cy=0; for (const p of m.pts){ cx+=p.x; cy+=p.y; } cx/=m.pts.length; cy/=m.pts.length;
-        lines.push({ px:cx, py:cy, dx:m.dx, dy:m.dy, count:m.count });
-    }
+function corridor(lines, light, w, h) {
     if (!lines.length) return { has:false };
-
     const user = { x: w/2, y: h*0.98 };
     let hx, hy;
     if (lines.length === 1) {
@@ -170,8 +177,8 @@ function corridor(dotted, P, scale, padX, padY, light, w, h) {
         for (let i=0;i<lines.length;i++) for (let j=i+1;j<lines.length;j++){
             const A=lines[i], B=lines[j], den=A.dx*B.dy - A.dy*B.dx;
             if (Math.abs(den) < 1e-3) continue;              // ~parallel -> no stable intersection
-            const t = ((B.px-A.px)*B.dy - (B.py-A.py)*B.dx) / den;
-            const ix = A.px + t*A.dx, iy = A.py + t*A.dy;
+            const t = ((B.cx-A.cx)*B.dy - (B.cy-A.cy)*B.dx) / den;
+            const ix = A.cx + t*A.dx, iy = A.cy + t*A.dy;
             if (iy > user.y || iy < -3*h || ix < -4*w || ix > 5*w) continue;   // implausible VP
             xs.push(ix); ys.push(iy);
         }
@@ -193,10 +200,20 @@ async function infer(buf) {
     const s = await load();
     const pre = await preprocess(buf);
     const out = await s.run({ [s.inputNames[0]]: pre.tensor });
+    const proto = out[s.outputNames[1]].data;                 // output1: 32 mask prototypes @160x160
     const dets = decode(out[s.outputNames[0]], pre.scale, pre.padX, pre.padY, pre.w, pre.h);
-    const dotted = dets.filter(d=>d.cls===DOTTED);
+    const dottedDets = dets.filter(d=>d.cls===DOTTED);
     const lights = dets.filter(d=>d.cls===LIGHT).sort((a,b)=>b.score-a.score);
     const light = lights[0] || null;
+
+    // Segmentation mask per dotted line -- this (not the box) drives everything.
+    const masks = [];
+    for (const det of dottedDets) {
+        const m = dottedMask(proto, det, pre.scale, pre.padX, pre.padY);
+        if (m) { m.conf = det.score; masks.push(m); }
+    }
+    const lines = masks.filter(m => m.count >= 8 && m.elong >= 2.0)   // genuine line segments
+                       .map(m => ({ cx:m.cx, cy:m.cy, dx:m.dx, dy:m.dy, count:m.count }));
 
     let lightOut = null;
     if (light) {
@@ -204,18 +221,18 @@ async function infer(buf) {
         lightOut = { box:[light.x1,light.y1,light.x2,light.y2], conf:light.score, state:ls.state,
                      areaFrac: ((light.x2-light.x1)*(light.y2-light.y1))/(pre.w*pre.h) };
     }
-    const cor = corridor(dotted, out[s.outputNames[1]].data, pre.scale, pre.padX, pre.padY, light, pre.w, pre.h);
-    const lowestDashY = dotted.length ? Math.max(...dotted.map(d=>d.y2)) : null;
+    const cor = corridor(lines, light, pre.w, pre.h);
+    const lowestMaskY = masks.length ? Math.max(...masks.map(m=>m.maxY)) : null;   // mask-based, not box
     return {
         w: pre.w, h: pre.h,
         light: lightOut,
-        dotted: dotted.map(d=>({ box:[d.x1,d.y1,d.x2,d.y2], conf:d.score })),
+        dotted: masks.map(m => ({ mask:m.client, conf:m.conf })),   // segmentation bitmap, not a box
         corridor: cor,
         signals: {
-            corridorAhead: dotted.length > 0,
+            corridorAhead: masks.length > 0,
             lightAreaFrac: lightOut ? lightOut.areaFrac : 0,
-            nDashes: dotted.length,
-            lowestDashYFrac: lowestDashY != null ? lowestDashY / pre.h : null
+            nDashes: masks.length,
+            lowestDashYFrac: lowestMaskY != null ? lowestMaskY / pre.h : null
         }
     };
 }
