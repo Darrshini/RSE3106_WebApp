@@ -30,7 +30,7 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json()); // for parsing API request bodies
+app.use(express.json({ limit: '15mb' })); // large limit for base64 camera frames posted to /api/infer
 
 // ============================================================
 // API routes -- browser can call these to get API keys safely
@@ -46,6 +46,28 @@ app.get('/api/config', (req, res) => {
         roboflowModelVersion: process.env.ROBOFLOW_MODEL_VERSION,
         googleMapsApiKey: process.env.GOOGLE_MAPS_API_KEY,
     });
+});
+
+// ============================================================
+// Crossing perception -- server-side YOLO11-seg inference.
+// The browser POSTs a base64 JPEG frame; we run the model + logic and return
+// the pedestrian-light state, the crossing-corridor direction vector, and the
+// per-frame end-of-crossing signals. The stateful decisions (fresh red->green
+// cross timing, reached-the-end) live in the browser (public/js/crossing.js).
+// ============================================================
+const crossing = require('./crossing_infer');
+crossing.load().catch(e => console.error('[infer] model preload failed:', e.message));
+
+app.post('/api/infer', async (req, res) => {
+    try {
+        const b64 = (req.body && req.body.image) || '';
+        const data = b64.replace(/^data:image\/\w+;base64,/, '');
+        if (!data) return res.status(400).json({ error: 'no image' });
+        res.json(await crossing.infer(Buffer.from(data, 'base64')));
+    } catch (e) {
+        console.error('[infer] error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ============================================================

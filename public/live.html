@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NavAssist — Live Crossing (Pi camera)</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { overflow: auto; }
+        .wrap { max-width: 860px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+        .topbar h1 { font-size: 20px; }
+        .topbar a { color: var(--accent-blue); text-decoration: none; font-size: 14px; }
+        .camera-view { position: relative; width: 100%; aspect-ratio: 16/9; background: #000;
+                       border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+        .camera-view video, .camera-view canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .camera-view video { object-fit: cover; }
+        .camera-view canvas { pointer-events: none; }
+        .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .btn { padding: 12px 22px; border-radius: 10px; border: 2px solid var(--accent-blue);
+               background: var(--accent-blue); color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
+        .statusline { font-size: 15px; color: var(--text-secondary); }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="topbar">
+            <h1>🚦 Live crossing — Pi camera</h1>
+            <a href="test.html">↦ Upload-video test</a>
+        </div>
+        <div class="camera-view">
+            <video id="feed" playsinline muted autoplay></video>
+            <canvas id="ov"></canvas>
+        </div>
+        <div class="controls">
+            <button id="startBtn" class="btn">Start camera</button>
+            <div class="statusline" id="status">Tap “Start camera”, allow access, and point at a crossing.</div>
+        </div>
+    </div>
+
+    <script src="js/crossing.js"></script>
+    <script>
+        const video = document.getElementById('feed');
+        const ov = document.getElementById('ov');
+        const st = document.getElementById('status');
+        function onStatus(state, msg) { st.textContent = state + (msg ? ' — ' + msg : ''); }
+
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 } }, audio: false
+                });
+                video.srcObject = stream;
+                await video.play();
+                st.textContent = 'Camera on — waiting at the crossing…';
+                window.Crossing.start(video, ov, onStatus);
+            } catch (e) {
+                st.textContent = 'Camera failed: ' + e.message + ' (needs https or localhost).';
+            }
+        });
+    </script>
+</body>
+</html>

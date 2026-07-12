@@ -8,9 +8,11 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
-    "ws": "^8.18.0",
+    "dotenv": "^16.4.5",
     "express": "^4.21.0",
-    "dotenv": "^16.4.5"
+    "onnxruntime-node": "^1.27.0",
+    "sharp": "^0.35.3",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.7"
