@@ -6,6 +6,8 @@ The instructions below are to set up the app locally on your PC or laptop if you
 I have hosted the webapp on an AWS instance, you can access it through this link: [Web app prototype](https://rse3106.duckdns.org/)
 I have changed it to HTTPS, however you will get a warning sign saying it's unsecure — this is normal, since I used a self-signed certificate, but it should work fine, just click
 **Advanced > Continue to Site**
+
+
 I needed to change from HTTP to HTTPS because in HTTP, GPS and the phone's compass will not work.
 
 ## Team 7
