@@ -477,11 +477,27 @@ window.navassist.onTrafficLightVisible = function(confidence) {
     }
 };
 
+// Audio-only direction guidance while walking toward the traffic light post.
+// Team decision: haptic is reserved for CROSSING only -- this phase uses
+// audio instead (previously haptic-only, silent otherwise). Announces on
+// direction CHANGE, not every frame, with a minimum gap between announcements
+// so it doesn't become constant chatter or flap back and forth on noisy
+// detections. Adjust NAV_SPEAK_COOLDOWN_MS if it feels too chatty or too slow
+// to react once tested on a real walk.
+let lastNavDirection = null;
+let lastNavSpeakAt = 0;
+const NAV_SPEAK_COOLDOWN_MS = 2000;
+
 window.navassist.onDirectionDecided = function(direction) {
     if (currentState !== STATES.NAVIGATING) return;
-    if (direction === 'LEFT')   sendHaptic('left',  'pulse');
-    if (direction === 'RIGHT')  sendHaptic('right', 'pulse');
-    if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.3, 200);
+    const now = Date.now();
+    if (direction === lastNavDirection || now - lastNavSpeakAt < NAV_SPEAK_COOLDOWN_MS) return;
+    lastNavDirection = direction;
+    lastNavSpeakAt = now;
+
+    if (direction === 'LEFT')       speak('Slightly left.');
+    else if (direction === 'RIGHT') speak('Slightly right.');
+    else                            speak('Straight ahead.');
 };
 
 window.navassist.onArrived = function() {
@@ -499,10 +515,16 @@ window.navassist.onArrived = function() {
     }
 };
 
-window.navassist.onGreenDetected = function() {
+window.navassist.onGreenDetected = function(direction) {
     if (currentState === STATES.WAITING) {
+        // Single consolidated message -- previously ai.js ALSO spoke a
+        // separate "Green man to your left." message for the same event,
+        // causing two overlapping/back-to-back announcements. Now there's
+        // exactly one, built here since this function already owns the
+        // "you may cross" wording and the confirm instruction.
+        const dirText = (direction && direction !== 'CENTRE') ? ` to your ${direction.toLowerCase()}` : '';
         transitionTo(STATES.CONFIRM_CROSSING,
-            'Green man. You may cross now. Double tap to confirm.');
+            `Green man${dirText}. You may cross now. Double tap to confirm.`);
         sendHaptic('both', 'pulse', 1.0, 800);
     }
 };
