@@ -107,11 +107,15 @@ function lightState(raw, w, h, box) {
             else if (hh<=22 || hh>=335) red++;     // red man / red pixels
         }
     }
+    // Report green-man and red presence INDEPENDENTLY -- the client needs both:
+    //   green only     = constant WALK (no countdown numeral)
+    //   green AND red   = clearance (flashing green man + red countdown) ON-phase
+    //   red only        = clearance OFF-blink OR constant DON'T-WALK (client times it out at 2s)
     const gMin = Math.max(15, 0.012*boxPx), rMin = Math.max(15, 0.020*boxPx);
-    let state='UNKNOWN';
-    if (green >= gMin) state='GREEN';              // green man lit = walk (even with a red countdown)
-    else if (red >= rMin) state='RED';
-    return { state, green, red, lit };
+    const g = green >= gMin, r = red >= rMin;
+    return { green: g, red: r,
+             state: g ? (r ? 'GREENRED' : 'GREEN') : (r ? 'RED' : 'NONE'),
+             greenCount: green, redCount: red, lit };
 }
 
 // ONE dotted-line instance, taken entirely from its SEGMENTATION MASK (not its
@@ -218,7 +222,8 @@ async function infer(buf) {
     let lightOut = null;
     if (light) {
         const ls = lightState(pre.origRaw, pre.w, pre.h, light);
-        lightOut = { box:[light.x1,light.y1,light.x2,light.y2], conf:light.score, state:ls.state,
+        lightOut = { box:[light.x1,light.y1,light.x2,light.y2], conf:light.score,
+                     green: ls.green, red: ls.red, state: ls.state,
                      areaFrac: ((light.x2-light.x1)*(light.y2-light.y1))/(pre.w*pre.h) };
     }
     const cor = corridor(lines, light, pre.w, pre.h);

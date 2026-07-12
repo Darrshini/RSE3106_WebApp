@@ -6,16 +6,21 @@
  * model + perception), draws the overlay (dotted-line boxes, pedestrian-light +
  * state, corridor direction vector), and runs the stateful decision FSM:
  *
- *   WAITING  -> if a crossing (dotted lines) is seen AND the green man is STEADY
- *               (non-blinking) -> cross now. In Singapore the green man is solid
- *               for the first seconds after red, THEN blinks 500ms on/500ms off
- *               during the clearance countdown. If it is already FLASHING before
- *               you start -> do NOT start; wait for the next steady green. RED is
- *               announced only after green has been ABSENT a sustained time, so an
- *               off-blink never reads as RED. smoothLight() tells the three apart.
- *   CROSSING -> guide along the corridor; announce "reached the other side" when
- *               the dashes run out ahead AND the light is close/gone (far side).
- *   DONE     -> returns to WAITING when a red is seen again.
+ * The pedestrian light is read as two INDEPENDENT signals per frame (from the
+ * server): green-man present, and red present (red man OR the red countdown
+ * numeral). The three meaningful readings:
+ *   GREEN only  = constant WALK (no countdown)         -> cross
+ *   GREEN + RED = clearance (flashing green + red count) -> if not started, wait
+ *   RED only    = clearance OFF-blink OR constant red   -> treat as still-green
+ *                 until red persists RED_HOLD (2s), then it's constant red.
+ *
+ *   WAITING  -> cross when GREEN-only + a crossing (dotted lines) is in view.
+ *               GREEN+RED (clearance) or RED -> keep waiting for the next constant
+ *               green. (Arriving mid-clearance => wait for the next turn.)
+ *   CROSSING -> guide along the corridor. Any green (GREEN or GREEN+RED) resets a
+ *               red timer; RED-only starts it. If red holds >= RED_HOLD (2s) the
+ *               light has switched to constant red -> "hurry to finish crossing".
+ *   DONE     -> reached the far side; returns to WAITING once the light is red.
  *
  * Exposes window.Crossing = { start(videoEl, overlayEl, onStatus), stop() }.
  */
@@ -29,25 +34,22 @@
         END_LIGHT_AREA: 0.02,     // light this big => you're at the far side
         END_NO_DASH_FRAMES: 6,    // consecutive frames with no dashes ahead => corridor ran out
         SPEAK_COOLDOWN: 3500,
-        // --- blinking green man smoothing (SG clearance blink = 500ms on / 500ms off) ---
-        GREEN_HOLD_MS: 2000,      // RED only after green is ABSENT this long. Must exceed one whole blink cycle PLUS a
-                                  // missed on-phase (off 500 + missed-on 500 + off 500 = 1500ms) so a blink -- even with
-                                  // an undetected on-phase -- never reads as RED. Green gone 2s straight => truly red.
-        MIN_BLINK_OFF_MS: 300,    // an observed off sustained this long = a real blink (=> FLASHING), not 1-frame noise
-        MAX_ON_GAP_MS: 400,       // trust green as continuous only across sample-gaps below this. Must sit ABOVE the
-                                  // real frame gap (~150-350ms) yet BELOW the physical off-phase (500ms), so a real
-                                  // blink-off can never hide unobserved inside a "continuous" run.
-        STEADY_CONFIRM_MS: 1100,  // green must be CONTINUOUSLY on this long to count as STEADY (crossable) green
-                                  // (> a full 1s blink cycle, so a flash-on can never masquerade as steady)
-        HIST_MS: 3000             // timestamped-sample history window the smoother recomputes from each frame
+        // --- pedestrian-light timing (SG clearance blink = 500ms on / 500ms off) ---
+        RED_HOLD_MS: 2000,        // red-only (no green) sustained this long => constant red (light switched back).
+                                  // Bridges a blink-off AND a missed on-phase (off 500 + missed-on 500 + off 500),
+                                  // so a clearance blink never trips the constant-red timer.
+        GREEN_CONFIRM_MS: 600     // green-only (no red numeral) observed continuously this long before we say "cross".
+                                  // Just longer than one 500ms clearance on-phase, so a flash-on whose numeral is
+                                  // momentarily missed can't be mistaken for constant green. (Not the old 1.1s wait.)
     };
     const S = { WAITING: 'WAITING', CROSSING: 'CROSSING', DONE: 'DONE' };
 
     let video, overlay, octx, cap, capctx, maskCanvas, maskCtx, onStatus;
     let running = false, inFlight = false, lastInferAt = 0, latest = null;
     let state = S.WAITING, noDash = 0, lastSpeakAt = 0, lastDirWord = '';
-    // temporal light smoother: a rolling buffer of {t, g} samples (see smoothLight)
-    let smSamples = [], lastLightEff = 'UNKNOWN';
+    // light timing state: redSince = when the current RED-only run began (null once any green shows);
+    // greenSince = when the current GREEN-only run began; hurried = "red, hurry" already announced.
+    let redSince = null, greenSince = null, hurried = false, lastCat = 'NONE';
 
     // returns true if it actually spoke (false if throttled) so callers can retry
     function speak(text, force) {
@@ -66,7 +68,7 @@
         cap = document.createElement('canvas'); capctx = cap.getContext('2d', { willReadFrequently: true });
         maskCanvas = document.createElement('canvas'); maskCtx = maskCanvas.getContext('2d');
         state = S.WAITING; noDash = 0; running = true;
-        smSamples = []; lastLightEff = 'UNKNOWN'; lastDirWord = ''; lastSpeakAt = 0;
+        redSince = null; greenSince = null; hurried = false; lastCat = 'NONE'; lastDirWord = ''; lastSpeakAt = 0;
         requestAnimationFrame(draw);
         loop();
     }
@@ -98,107 +100,65 @@
         if (r && r.w) { latest = r; decide(r, performance.now()); }
     }
 
-    // ---- temporal light smoother (blinking green man) ----
-    // The server classifies each FRAME independently; blinking + irregular sampling
-    // (the effective frame rate is bounded by inference latency, not INFER_MS) are
-    // temporal. We keep a short timestamped history and RECOMPUTE the effective
-    // state from scratch every frame -- no persistent latches, so per-frame noise
-    // can't corrupt a whole episode. Returns:
-    //   'GREEN'     steady, crossable  (green CONTINUOUSLY observed on >= STEADY_CONFIRM)
-    //   'GREEN_NEW' green on/held but not yet confirmed steady
-    //   'FLASHING'  clearance blink   (a sustained off observed within the green episode)
-    //   'RED' | 'UNKNOWN'
-    // Safety: GREEN requires truly-continuous on-time -- ANY observed off resets it,
-    // so a ~0.5s flash-on can never reach STEADY_CONFIRM => never a mid-clearance cross.
-    // A lone green frame (needs >=2) never opens an episode, so noise can't mask RED.
-    function smoothLight(light, t) {
-        const greenNow = !!(light && light.state === 'GREEN');
-        smSamples.push({ t, g: greenNow });
-        while (smSamples.length && t - smSamples[0].t > CFG.HIST_MS) smSamples.shift();
-
-        let lastG = -1; for (const s of smSamples) if (s.g) lastG = s.t;
-        if (lastG < 0 || (t - lastG) > CFG.GREEN_HOLD_MS) {       // green truly gone -> end the episode
-            smSamples = [{ t, g: greenNow }];                    // clear so the next green starts a FRESH episode
-            return (light && light.state === 'RED') ? 'RED' : 'UNKNOWN';
-        }
-        const greens = smSamples.filter(s => s.g);
-        if (greens.length < 2) return (light && light.state === 'RED') ? 'RED' : 'UNKNOWN';   // 1 lone green = noise
-
-        // Continuous-on run: contiguous green samples, but ONLY credit a gap between
-        // consecutive samples if it is smaller than MIN_BLINK_OFF -- otherwise a real
-        // off could have hidden unobserved in that gap (coarse/aliased sampling), so we
-        // must NOT assume the green was continuous across it. Consequence: if the frame
-        // rate is too slow to catch a blink-off, onRun never reaches STEADY_CONFIRM and
-        // we stay GREEN_NEW (no cross) rather than risk a false cross during clearance.
-        let onRun = 0;
-        if (greenNow) {
-            let start = t, prev = t;
-            for (let i = smSamples.length - 1; i >= 0 && smSamples[i].g; i--) {
-                if (prev - smSamples[i].t > CFG.MAX_ON_GAP_MS) break;   // gap too big -> a blink-off may hide here
-                start = smSamples[i].t; prev = smSamples[i].t;
-            }
-            onRun = t - start;
-        }
-
-        // longest OFF run observed within this episode (after the first green)
-        const firstG = greens[0].t;
-        let maxOff = 0, offStart = -1;
-        for (const s of smSamples) {
-            if (s.t < firstG) continue;
-            if (s.g) offStart = -1;
-            else { if (offStart < 0) offStart = s.t; if (s.t - offStart > maxOff) maxOff = s.t - offStart; }
-        }
-        if (!greenNow && offStart >= 0 && t - offStart > maxOff) maxOff = t - offStart;   // extend a trailing off to now
-
-        if (greenNow && onRun >= CFG.STEADY_CONFIRM_MS) return 'GREEN';   // steady wins (safety: needs full on-run)
-        if (maxOff >= CFG.MIN_BLINK_OFF_MS) return 'FLASHING';            // a real off happened => clearance blink
-        return 'GREEN_NEW';
-    }
-
-    // ---- decision FSM ----
-    function decide(r, now) {
+    // ---- decision FSM (driven by the two independent light signals) ----
+    function decide(r, t) {
         const light = r.light;
-        const eff = smoothLight(light, now);
+        const green = !!(light && light.green);      // green man present this frame
+        const red = !!(light && light.red);          // red present (red man OR red countdown numeral)
         const close = !!(light && light.areaFrac >= CFG.LIGHT_CLOSE_AREA);
-        const changed = eff !== lastLightEff;
-        lastLightEff = eff;
+        const crossingSeen = !!(r.signals && r.signals.corridorAhead);
+        const cat = green ? (red ? 'GREEN_RED' : 'GREEN_ONLY') : (red ? 'RED_ONLY' : 'NONE');
+        const changed = cat !== lastCat; lastCat = cat;
 
-        const crossingSeen = !!(r.signals && r.signals.corridorAhead);   // a pedestrian crossing (dotted lines) is in view
+        // Red timer: ANY green resets it; a run of RED-only advances it. Sustained
+        // RED-only for RED_HOLD means the light has switched to constant red.
+        if (green) redSince = null;
+        else if (cat === 'RED_ONLY' && redSince == null) redSince = t;
+        const constantRed = redSince != null && (t - redSince) >= CFG.RED_HOLD_MS;
+
+        // Green-only onset: require a brief run so one stray green frame can't fire a cross.
+        if (cat === 'GREEN_ONLY') { if (greenSince == null) greenSince = t; }
+        else greenSince = null;
+        const greenGo = greenSince != null && (t - greenSince) >= CFG.GREEN_CONFIRM_MS;
 
         if (state === S.WAITING) {
-            if (eff === 'GREEN' && close && crossingSeen) {          // STEADY (non-blinking) green at a crossing => go
-                state = S.CROSSING; noDash = 0;
+            if (cat === 'GREEN_ONLY' && close && crossingSeen && greenGo) {   // constant green at a crossing => go
+                state = S.CROSSING; hurried = false; noDash = 0;
                 speak('Green man. You may cross now.', true);
                 status('CROSS NOW');
-            } else if (eff === 'FLASHING' && close) {                // already blinking before we started => do NOT start
+            } else if (cat === 'GREEN_RED' && close) {                        // clearance (green + countdown) => don't start
                 if (changed) speak('Green is flashing, do not start. Wait for the next green.');
-                status('waiting — flashing, do not start');
-            } else if (eff === 'RED' && close) {
+                status('waiting — clearance, wait for next green');
+            } else if (cat === 'RED_ONLY' && close) {
                 if (changed) speak('Red man. Please wait.');
                 status('waiting — red');
-            } else if (eff === 'GREEN' && close) {                   // steady green but no crossing detected (yet)
-                status('green — looking for the crossing…');
-            } else if (eff === 'GREEN_NEW' && close) {
-                status('green — confirming it is steady…');          // just came on; wait until steady-confirmed
+            } else if (cat === 'GREEN_ONLY' && close) {
+                status('green — get ready…');                                // onset confirming, or no crossing seen yet
+            } else {
+                status('looking for the pedestrian light…');
             }
         } else if (state === S.CROSSING) {
             if (r.corridor && r.corridor.has) {
                 noDash = 0;
                 const word = dirWord(r.corridor, r.w);
                 if (word && word !== lastDirWord) {
-                    if (speak(word, lastDirWord === '')) lastDirWord = word;   // force FIRST cue; commit only when actually spoken
+                    if (speak(word, lastDirWord === '')) lastDirWord = word;  // force the FIRST cue; commit only if spoken
                 }
-                status('crossing — ' + word);
+            } else { noDash++; }
+            if (constantRed) {                                               // light switched to constant red mid-crossing
+                if (!hurried) { hurried = true; speak('The light is red. Hurry to finish crossing.', true); }
+                status('crossing — RED, hurry!');
             } else {
-                noDash++;
-                status('crossing');
+                status('crossing' + (lastDirWord ? ' — ' + lastDirWord : ''));
             }
             const lightBig = light && light.areaFrac >= CFG.END_LIGHT_AREA;
-            if (noDash >= CFG.END_NO_DASH_FRAMES && (lightBig || !light)) {
-                state = S.DONE; speak('You have reached the other side. Use your cane to confirm the kerb.', true); status('reached the other side');
+            if (noDash >= CFG.END_NO_DASH_FRAMES && (lightBig || !light)) {   // dashes ran out + light close/gone => far side
+                state = S.DONE;
+                speak('You have reached the other side. Use your cane to confirm the kerb.', true);
+                status('reached the other side');
             }
-        } else if (state === S.DONE) {
-            if (eff === 'RED' && close) { state = S.WAITING; }       // ready for the next crossing
+        } else if (state === S.DONE) {                                       // end of crossing -> ready for the next turn
+            if (cat === 'RED_ONLY' || constantRed) { state = S.WAITING; redSince = null; greenSince = null; hurried = false; }
         }
     }
 
@@ -226,9 +186,11 @@
         for (const d of r.dotted) if (d.mask) drawMask(d.mask);   // the model's segmentation, not a box
 
         if (r.light) {
-            const b = r.light.box, col = r.light.state === 'GREEN' ? '#00e676' : r.light.state === 'RED' ? '#ff1744' : '#ffab00';
+            const st = r.light.state;   // GREEN | GREENRED | RED | NONE
+            const col = st === 'GREEN' ? '#00e676' : st === 'RED' ? '#ff1744' : st === 'GREENRED' ? '#ffab00' : '#9e9e9e';
+            const b = r.light.box;
             octx.lineWidth = lw * 1.3; octx.strokeStyle = col; octx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]);
-            tag(octx, 'light ' + r.light.state, b[0], b[1], col, fp);
+            tag(octx, 'light ' + st, b[0], b[1], col, fp);
         }
         if (r.corridor && r.corridor.has) arrow(octx, r.corridor.near, r.corridor.far, '#00e5ff', W);
 
@@ -236,20 +198,19 @@
     }
 
     function bannerText() {
-        if (state === S.CROSSING) return '🟢 CROSS — ' + (lastDirWord || 'straight ahead');
+        if (state === S.CROSSING) return hurried ? '🏃 RED — hurry across' : '🟢 CROSS — ' + (lastDirWord || 'straight ahead');
         if (state === S.DONE) return '✓ Reached the other side';
-        if (lastLightEff === 'GREEN') return '🟢 Green — steady';
-        if (lastLightEff === 'GREEN_NEW') return '🟢 Green — confirming…';
-        if (lastLightEff === 'FLASHING') return '🟡 Flashing — don’t start';
-        if (lastLightEff === 'RED') return '🔴 Wait';
-        return 'Looking for the crossing…';
+        if (lastCat === 'GREEN_ONLY') return '🟢 Green — go';
+        if (lastCat === 'GREEN_RED') return '🟡 Clearance — wait for next green';
+        if (lastCat === 'RED_ONLY') return '🔴 Wait';
+        return 'Looking for the light…';
     }
     function bannerColor() {
-        if (state === S.CROSSING) return '#00c853';
+        if (state === S.CROSSING) return hurried ? '#ff1744' : '#00c853';
         if (state === S.DONE) return '#2979ff';
-        if (lastLightEff === 'FLASHING') return '#ffab00';
-        if (lastLightEff === 'RED') return '#ff1744';
-        if (lastLightEff === 'GREEN' || lastLightEff === 'GREEN_NEW') return '#00c853';
+        if (lastCat === 'GREEN_ONLY') return '#00c853';
+        if (lastCat === 'GREEN_RED') return '#ffab00';
+        if (lastCat === 'RED_ONLY') return '#ff1744';
         return '#555';
     }
 
