@@ -221,7 +221,7 @@ function checkHeadingDrift() {
         const now = Date.now();
         if (Math.abs(drift) > SIGNIFICANT_TURN_DEG && now - lastTurnWarningAt > TURN_WARNING_COOLDOWN_MS) {
             lastTurnWarningAt = now;
-            speak('You have turned away. Follow the haptic feedback to re-orient toward the crossing.');
+            speak('You have turned away. Listen for the voice directions to re-orient toward the crossing.');
             navigatingStartHeading = currentHeading;  // reset reference so this only re-fires after another significant turn
         }
     }
@@ -598,7 +598,7 @@ function classifyGesture(count) {
                 speak('Scanning in progress. Please wait.');
                 break;
             case STATES.NAVIGATING:
-                speak('Follow the haptic feedback on the glasses to reach the crossing.');
+                speak('Listen for the voice directions to reach the crossing.');
                 break;
             case STATES.WAITING:
                 speak('Please wait for the green man signal.');
@@ -632,7 +632,7 @@ function handleIntent(intent) {
         case 'CONFIRM_YES':
             if (currentState === STATES.CONFIRM_TARGET) {
                 navigatingStartHeading = currentHeading;
-                transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
+                transitionTo(STATES.NAVIGATING, 'Confirmed. I will guide you with voice directions.');
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 crossingStartHeading = currentHeading;
                 crossingStartLocation = currentLocation;  // may be null if no GPS fix yet -- handled below
@@ -673,7 +673,7 @@ const UI_CONFIG = {
     RESOLVING:        { icon: '📍', label: 'Locating...', cls: 'state-confirm', hint: '', msg: 'Finding nearby crossings.' },
     TARGET_DETECTED:  { icon: '🚦', label: 'Found!', cls: 'state-success', hint: '', msg: 'Traffic light found.' },
     CONFIRM_TARGET:   { icon: '?', label: 'Confirm', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = No', msg: 'Is this the right crossing?' },
-    NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Follow haptic feedback.' },
+    NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Listen for voice directions.' },
     REACHED:          { icon: '✓', label: 'Arrived', cls: 'state-success', hint: '', msg: 'You have arrived.' },
     WAITING:          { icon: '🔴', label: 'Red man', cls: 'state-danger', hint: '', msg: 'Please wait.' },
     CONFIRM_CROSSING: { icon: '🟢', label: 'Cross now?', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = Wait', msg: 'Green man. Ready to cross?' },
@@ -726,7 +726,7 @@ const STATE_SPEECH = {
     RESOLVING:        'Identifying nearby crossings. Please wait.',
     TARGET_DETECTED:  'Traffic light found.',
     CONFIRM_TARGET:   'Is this the right crossing? Double tap for yes, triple tap to try again.',
-    NAVIGATING:       'Confirmed. Follow the haptic feedback toward the crossing.',
+    NAVIGATING:       'Confirmed. I will guide you with voice directions.',
     REACHED:          'You have reached the crossing.',
     WAITING:          'Checking the signal…',
     CONFIRM_CROSSING: 'Green man. You may cross. Double tap to confirm.',
