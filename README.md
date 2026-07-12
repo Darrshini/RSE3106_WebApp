@@ -36,6 +36,8 @@ The Node.js server relays messages between the browser and the Raspberry Pi. All
 
 **Note on heading/orientation:** we decided not to use a physical accelerometer/gyroscope on the glasses hardware. Instead, `app.js` reads heading directly from the **phone's own built-in compass** (via the browser's `DeviceOrientationEvent`) to drive the "you've turned away" warning and the haptic drift-correction while crossing. This is a deliberate tradeoff — phone compass data can be noisier than a dedicated IMU, and assumes the phone stays reasonably oriented with the user, but it saved significant hardware/integration time. **This only works on mobile browsers**, not laptops — most laptops don't have the sensors to produce this data at all, so heading-based features can't be tested on a laptop, only on an actual phone. On iPhone specifically, the first time the app is opened it'll show a one-time "Motion & Orientation" permission popup — you must tap **Allow**, otherwise heading data silently never arrives.
 
+
+To setup the webapp on your laptop or pc:
  - ENSURE YOU HAVE NODE.JS INSTALLED ON YOUR PC OR LAPTOP. CHECK IN TERMINAL: `node --version`
  - if you see an error, install Node.js from this site: https://nodejs.org/en/download
  - ensure Node.js is installed before starting the next setup instructions below:
