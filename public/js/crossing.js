@@ -30,8 +30,7 @@
         LOOP_MS: 40,
         JPEG_Q: 0.6,
         CAP_W: 960,               // downscale frame sent to the server (speed)
-        LIGHT_CLOSE_AREA: 0.004,  // light this big (frac of frame) => trust its state
-        END_LIGHT_AREA: 0.02,     // light this big => you're at the far side
+        END_LIGHT_AREA: 0.02,     // light this big => you're at the far side (used only for reached-the-end)
         END_NO_DASH_FRAMES: 6,    // consecutive frames with no dashes ahead => corridor ran out
         SPEAK_COOLDOWN: 3500,
         // --- pedestrian-light timing (SG clearance blink = 500ms on / 500ms off) ---
@@ -102,7 +101,9 @@
         const light = r.light;
         const green = !!(light && light.green);      // green man present this frame
         const red = !!(light && light.red);          // red present (red man OR red countdown numeral)
-        const close = !!(light && light.areaFrac >= CFG.LIGHT_CLOSE_AREA);
+        // NOTE: no "close/area" gate -- the pedestrian light sits ACROSS the road, so it is
+        // always small in view; the decision moment (constant green from the near kerb) has a
+        // small light box. Using the box size as a proximity gate wrongly ignored it.
         const crossingSeen = !!(r.signals && r.signals.corridorAhead);
         const cat = green ? (red ? 'GREEN_RED' : 'GREEN_ONLY') : (red ? 'RED_ONLY' : 'NONE');
         const changed = cat !== lastCat; lastCat = cat;
@@ -117,17 +118,17 @@
         // WAITING (haven't started) => wait; the SAME readings after we've started (CROSSING)
         // just keep us going. So in WAITING we start the moment we see constant green.
         if (state === S.WAITING) {
-            if (cat === 'GREEN_ONLY' && close && crossingSeen) {             // constant green (no numeral) at a crossing => GO NOW
+            if (cat === 'GREEN_ONLY' && crossingSeen) {                      // constant green (no numeral) at a crossing => GO NOW
                 state = S.CROSSING; hurried = false; noDash = 0;
                 speak('Green man. You may cross now.', true);
                 status('CROSS NOW');
-            } else if (cat === 'GREEN_RED' && close) {                        // clearance (green + countdown) as initial => wait
+            } else if (cat === 'GREEN_RED') {                                // clearance (green + countdown) as initial => wait
                 if (changed) speak('Green is flashing, wait for the next green.');
                 status('waiting — clearance, wait for next green');
-            } else if (cat === 'RED_ONLY' && close) {
+            } else if (cat === 'RED_ONLY') {
                 if (changed) speak('Red man. Please wait.');
                 status('waiting — red');
-            } else if (cat === 'GREEN_ONLY' && close) {
+            } else if (cat === 'GREEN_ONLY') {
                 status('green — looking for the crossing…');                 // constant green but no crossing detected yet
             } else {
                 status('looking for the pedestrian light…');
