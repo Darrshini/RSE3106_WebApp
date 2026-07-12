@@ -35,12 +35,9 @@
         END_NO_DASH_FRAMES: 6,    // consecutive frames with no dashes ahead => corridor ran out
         SPEAK_COOLDOWN: 3500,
         // --- pedestrian-light timing (SG clearance blink = 500ms on / 500ms off) ---
-        RED_HOLD_MS: 2000,        // red-only (no green) sustained this long => constant red (light switched back).
+        RED_HOLD_MS: 2000         // red-only (no green) sustained this long => constant red (light switched back).
                                   // Bridges a blink-off AND a missed on-phase (off 500 + missed-on 500 + off 500),
                                   // so a clearance blink never trips the constant-red timer.
-        GREEN_CONFIRM_MS: 600     // green-only (no red numeral) observed continuously this long before we say "cross".
-                                  // Just longer than one 500ms clearance on-phase, so a flash-on whose numeral is
-                                  // momentarily missed can't be mistaken for constant green. (Not the old 1.1s wait.)
     };
     const S = { WAITING: 'WAITING', CROSSING: 'CROSSING', DONE: 'DONE' };
 
@@ -48,8 +45,8 @@
     let running = false, inFlight = false, lastInferAt = 0, latest = null;
     let state = S.WAITING, noDash = 0, lastSpeakAt = 0, lastDirWord = '';
     // light timing state: redSince = when the current RED-only run began (null once any green shows);
-    // greenSince = when the current GREEN-only run began; hurried = "red, hurry" already announced.
-    let redSince = null, greenSince = null, hurried = false, lastCat = 'NONE';
+    // hurried = "red, hurry" already announced this crossing.
+    let redSince = null, hurried = false, lastCat = 'NONE';
 
     // returns true if it actually spoke (false if throttled) so callers can retry
     function speak(text, force) {
@@ -68,7 +65,7 @@
         cap = document.createElement('canvas'); capctx = cap.getContext('2d', { willReadFrequently: true });
         maskCanvas = document.createElement('canvas'); maskCtx = maskCanvas.getContext('2d');
         state = S.WAITING; noDash = 0; running = true;
-        redSince = null; greenSince = null; hurried = false; lastCat = 'NONE'; lastDirWord = ''; lastSpeakAt = 0;
+        redSince = null; hurried = false; lastCat = 'NONE'; lastDirWord = ''; lastSpeakAt = 0;
         requestAnimationFrame(draw);
         loop();
     }
@@ -116,24 +113,22 @@
         else if (cat === 'RED_ONLY' && redSince == null) redSince = t;
         const constantRed = redSince != null && (t - redSince) >= CFG.RED_HOLD_MS;
 
-        // Green-only onset: require a brief run so one stray green frame can't fire a cross.
-        if (cat === 'GREEN_ONLY') { if (greenSince == null) greenSince = t; }
-        else greenSince = null;
-        const greenGo = greenSince != null && (t - greenSince) >= CFG.GREEN_CONFIRM_MS;
-
+        // WAITING vs CROSSING IS the "initial reading" distinction: green+red / red while
+        // WAITING (haven't started) => wait; the SAME readings after we've started (CROSSING)
+        // just keep us going. So in WAITING we start the moment we see constant green.
         if (state === S.WAITING) {
-            if (cat === 'GREEN_ONLY' && close && crossingSeen && greenGo) {   // constant green at a crossing => go
+            if (cat === 'GREEN_ONLY' && close && crossingSeen) {             // constant green (no numeral) at a crossing => GO NOW
                 state = S.CROSSING; hurried = false; noDash = 0;
                 speak('Green man. You may cross now.', true);
                 status('CROSS NOW');
-            } else if (cat === 'GREEN_RED' && close) {                        // clearance (green + countdown) => don't start
-                if (changed) speak('Green is flashing, do not start. Wait for the next green.');
+            } else if (cat === 'GREEN_RED' && close) {                        // clearance (green + countdown) as initial => wait
+                if (changed) speak('Green is flashing, wait for the next green.');
                 status('waiting — clearance, wait for next green');
             } else if (cat === 'RED_ONLY' && close) {
                 if (changed) speak('Red man. Please wait.');
                 status('waiting — red');
             } else if (cat === 'GREEN_ONLY' && close) {
-                status('green — get ready…');                                // onset confirming, or no crossing seen yet
+                status('green — looking for the crossing…');                 // constant green but no crossing detected yet
             } else {
                 status('looking for the pedestrian light…');
             }
@@ -158,7 +153,7 @@
                 status('reached the other side');
             }
         } else if (state === S.DONE) {                                       // end of crossing -> ready for the next turn
-            if (cat === 'RED_ONLY' || constantRed) { state = S.WAITING; redSince = null; greenSince = null; hurried = false; }
+            if (cat === 'RED_ONLY' || constantRed) { state = S.WAITING; redSince = null; hurried = false; }
         }
     }
 
