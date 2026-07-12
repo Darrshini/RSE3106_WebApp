@@ -507,6 +507,28 @@ window.navassist.onGreenDetected = function() {
     }
 };
 
+// Called by ai.js on every frame where a green man is detected while WAITING
+// (before the user has double-tapped to confirm crossing). Gives a light
+// directional nudge toward which side the green man is on -- distinct from
+// onGreenDetected's strong 'both' pulse, which signals "you may cross" once.
+// Has its OWN cooldown here (not in ai.js) since ai.js calls this every frame
+// -- without throttling, this would buzz continuously while WAITING.
+let lastGreenDirectionHapticAt = 0;
+const GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000;
+
+window.navassist.onGreenDirection = function(direction) {
+    if (currentState !== STATES.WAITING) return;
+    const now = Date.now();
+    if (now - lastGreenDirectionHapticAt < GREEN_DIRECTION_HAPTIC_COOLDOWN_MS) return;
+    lastGreenDirectionHapticAt = now;
+
+    // CENTRE isn't buzzed here -- onGreenDetected's strong pulse (fired
+    // separately, once, on first detection) already covers the straight-
+    // ahead "go" case without needing a repeated nudge on top of it.
+    if (direction === 'LEFT')       sendHaptic('left',  'pulse', 0.5, 200);
+    else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.5, 200);
+};
+
 // ============================================================
 // Gesture detection -- ENTIRE SCREEN
 // ============================================================
