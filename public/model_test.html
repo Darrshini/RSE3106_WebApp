@@ -68,10 +68,38 @@ async function runOnImage(file) {
     const results = await session.run(feeds);
     const out = results[session.outputNames[0]];
     const dets = postprocess(out, pre);
+    const topRaw = getTopRawScores(out, 5);   // debug: ignores CONF_THRESH entirely
 
     drawDetections(dets);
-    statusEl.textContent = `${file.name}: ${dets.length} detection(s)\n` +
+    let msg = `${file.name}: ${dets.length} detection(s) above ${CONF_THRESH} threshold\n` +
         dets.map(d => `  ${CLASSES[d.cls]} (${Math.round(d.score*100)}%)`).join('\n');
+    msg += `\n\nTop raw scores (ignoring threshold, for debugging):\n` +
+        topRaw.map(t => `  ${CLASSES[t.cls]}: ${(t.score*100).toFixed(1)}%`).join('\n');
+    statusEl.textContent = msg;
+}
+
+// Debug helper: returns the N highest confidence scores across ALL anchors,
+// regardless of CONF_THRESH -- lets you see if the model is "almost" seeing
+// something (e.g. 20% when threshold is 35%) vs completely missing it (near 0%).
+function getTopRawScores(out, n) {
+    const dims = out.dims;
+    const num = dims[2];
+    const nCls = dims[1] - 4;
+    const d = out.data;
+    const all = [];
+    for (let a = 0; a < num; a++) {
+        for (let c = 0; c < nCls; c++) {
+            all.push({ score: d[(4 + c) * num + a], cls: c });
+        }
+    }
+    all.sort((a, b) => b.score - a.score);
+    // Dedupe by class, keep highest per class first, then fill remaining slots
+    const seen = new Set(), out2 = [];
+    for (const item of all) {
+        if (out2.length >= n) break;
+        out2.push(item);
+    }
+    return out2;
 }
 
 function loadImageFile(file) {
