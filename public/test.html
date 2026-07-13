@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NavAssist — Crossing Test (upload video)</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { overflow: auto; }
+        .wrap { max-width: 860px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+        .topbar h1 { font-size: 20px; }
+        .topbar a { color: var(--accent-blue); text-decoration: none; font-size: 14px; }
+        .camera-view { position: relative; width: 100%; aspect-ratio: 16/9; background: #000;
+                       border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+        .camera-view video, .camera-view canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .camera-view video { object-fit: contain; }
+        .camera-view canvas { pointer-events: none; }
+        .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+        .statusline { font-size: 15px; color: var(--text-secondary); }
+        input[type=file] { color: var(--text-secondary); }
+        label.mute { font-size: 13px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="topbar">
+            <h1>🎞️ Crossing test — upload a video</h1>
+            <a href="live.html">↦ Live Pi-camera page</a>
+        </div>
+        <div class="camera-view">
+            <video id="feed" playsinline controls loop></video>
+            <canvas id="ov"></canvas>
+        </div>
+        <div class="controls">
+            <input type="file" id="file" accept="video/*">
+            <label class="mute"><input type="checkbox" id="muteSpeech"> mute speech</label>
+            <div class="statusline" id="status">Choose a video (e.g. your Pi clip) to run the crossing model on it.</div>
+        </div>
+    </div>
+
+    <script src="js/crossing.js"></script>
+    <script>
+        const video = document.getElementById('feed');
+        const ov = document.getElementById('ov');
+        const st = document.getElementById('status');
+        let muted = false;
+        document.getElementById('muteSpeech').addEventListener('change', e => { muted = e.target.checked; if (muted && window.speechSynthesis) speechSynthesis.cancel(); });
+        function onStatus(state, msg) { st.textContent = state + (msg ? ' — ' + msg : ''); }
+
+        // suppress speech when muted (crossing.js falls back to speechSynthesis)
+        const _speak = window.speechSynthesis ? speechSynthesis.speak.bind(speechSynthesis) : null;
+        if (_speak) speechSynthesis.speak = u => { if (!muted) _speak(u); };
+
+        document.getElementById('file').addEventListener('change', (e) => {
+            const f = e.target.files[0]; if (!f) return;
+            video.src = URL.createObjectURL(f);
+            video.play().catch(() => {});
+            st.textContent = 'Running the model on: ' + f.name;
+            window.Crossing.start(video, ov, onStatus);
+        });
+    </script>
+</body>
+</html>

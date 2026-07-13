@@ -30,7 +30,7 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
-app.use(express.json()); // for parsing API request bodies
+app.use(express.json({ limit: '15mb' })); // large limit for base64 camera frames posted to /api/infer
 
 // ============================================================
 // API routes -- browser can call these to get API keys safely
@@ -49,6 +49,29 @@ app.get('/api/config', (req, res) => {
 });
 
 // ============================================================
+// Crossing perception -- server-side YOLO11-seg inference.
+// The browser POSTs a base64 JPEG frame; we run the model + logic and return
+// the pedestrian-light state, the crossing-corridor direction vector, and the
+// per-frame end-of-crossing signals. The stateful decisions (state machine,
+// gestures, confirmations) all still live in app.js/ai.js -- this endpoint
+// is purely perception, stays stateless.
+// ============================================================
+const crossing = require('./crossing_infer');
+crossing.load().catch(e => console.error('[infer] model preload failed:', e.message));
+
+app.post('/api/infer', async (req, res) => {
+    try {
+        const b64 = (req.body && req.body.image) || '';
+        const data = b64.replace(/^data:image\/\w+;base64,/, '');
+        if (!data) return res.status(400).json({ error: 'no image' });
+        res.json(await crossing.infer(Buffer.from(data, 'base64')));
+    } catch (e) {
+        console.error('[infer] error:', e.message);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ============================================================
 // HTTP server -- wraps Express so WebSocket can share the port
 // ============================================================
 
@@ -63,7 +86,9 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Track connected clients by type
-let browserClient = null;
+// browserClients is a Set (not a single slot) so multiple people can view
+// the live feed simultaneously -- every message gets broadcast to all of them.
+let browserClients = new Set();
 let esp32Client = null;
 
 wss.on('connection', (ws, req) => {
@@ -76,17 +101,20 @@ wss.on('connection', (ws, req) => {
     // Browser connects to /browser
     // ESP32 connects to /esp32
     if (url === '/browser') {
-        browserClient = ws;
-        console.log('[WS] Browser connected');
+        browserClients.add(ws);
+        console.log(`[WS] Browser connected (${browserClients.size} total viewer(s))`);
 
-        // Tell browser the current ESP32 connection status
-        sendToBrowser({
+        // Tell THIS newly-connected browser the current ESP32 status --
+        // sent directly to it, not broadcast, so other already-connected
+        // viewers don't get a redundant duplicate status message.
+        const statusMsg = JSON.stringify({
             topic: 'connection/event',
             timestamp: Date.now(),
             payload: {
                 event: esp32Client ? 'esp32_connected' : 'esp32_disconnected'
             }
         });
+        if (ws.readyState === 1) ws.send(statusMsg);
 
         ws.on('message', (data) => {
             // Browser → ESP32 (e.g. haptic commands)
@@ -100,8 +128,8 @@ wss.on('connection', (ws, req) => {
         });
 
         ws.on('close', () => {
-            console.log('[WS] Browser disconnected');
-            browserClient = null;
+            browserClients.delete(ws);
+            console.log(`[WS] Browser disconnected (${browserClients.size} remaining)`);
         });
 
     } else if (url === '/esp32') {
@@ -150,9 +178,45 @@ wss.on('connection', (ws, req) => {
 // Helper functions
 // ============================================================
 
+// Camera frames dropped so far, plus when we last logged -- so we can report
+// drops occasionally instead of flooding the console every frame.
+let droppedCamFrames = 0;
+let lastDropLogAt = 0;
+
 function sendToBrowser(message) {
-    if (browserClient && browserClient.readyState === 1) {
-        browserClient.send(JSON.stringify(message));
+    const data = JSON.stringify(message);
+    const isCameraFrame = message.topic === 'camera/image';
+
+    for (const client of browserClients) {
+        if (client.readyState !== 1) continue;
+
+        // Backpressure-aware frame dropping. WebSocket is reliable + ordered,
+        // so if a browser can't drain frames as fast as the camera produces
+        // them, they don't drop -- they queue in this socket's send buffer and
+        // the on-screen feed falls further and further behind (the lag you see
+        // only once the server is in the loop). bufferedAmount is how many
+        // bytes are still waiting to go out to THIS client. If more than
+        // roughly one whole frame is already queued, skip sending this frame to
+        // that client -- it'd only add latency, and a newer frame is coming.
+        // Only camera frames are dropped; heartbeat / IMU / connection events
+        // are small and important, so they always go through.
+        if (isCameraFrame && client.bufferedAmount > data.length) {
+            droppedCamFrames++;
+            continue;
+        }
+
+        client.send(data);
+    }
+
+    // Occasional summary so it's visible that dropping is happening (and how
+    // much), without logging on every single frame.
+    if (isCameraFrame && droppedCamFrames > 0) {
+        const now = Date.now();
+        if (now - lastDropLogAt > 2000) {
+            console.log(`[WS] Dropped ${droppedCamFrames} stale camera frame(s) in the last ~2s to keep the feed low-latency`);
+            droppedCamFrames = 0;
+            lastDropLogAt = now;
+        }
     }
 }
 

@@ -5,22 +5,22 @@
  * Camera processing + AI inference + direction logic.
  *
  * Runs a locally-trained YOLO11 pedestrian-traffic-light model
- * (red / green / traffic-light) fully in the browser via onnxruntime-web.
- * Video source is the ESP32 glasses camera, delivered as base64 JPEG
- * frames over the WebSocket relay (topic 'camera/image'), NOT the
- * laptop/phone's own webcam.
+ * (red / green / traffic-light). onnxruntime-web runs the model inside
+ * js/inference.worker.js (a Web Worker), NOT on this thread, so inference
+ * never freezes the camera feed / gestures / heartbeat. Video source is the
+ * glasses camera, delivered as base64 JPEG frames over the WebSocket relay
+ * (topic 'camera/image'), NOT the laptop/phone's own webcam.
  *
  * Flow:
  *   1. app.js calls handleCameraFrame(payload) every time a 'camera/image'
- *      message arrives from the ESP32.
+ *      message arrives from the glasses.
  *   2. Each frame is decoded into an Image, drawn onto the #camFrame canvas,
- *      and fed into the YOLO model (throttled to INFER_EVERY_MS).
+ *      and (throttled to INFER_EVERY_MS) pre-processed and handed to the
+ *      inference worker, which runs the model and returns detections.
  *   3. Detections are drawn on the #camOverlay canvas: bounding boxes,
  *      a direction arrow to the strongest GREEN light, and a status HUD.
  *   4. FSM callbacks (window.navassist.*) drive app.js's state machine and
  *      audio announcements.
- *
- * `ort` (onnxruntime-web) is loaded globally by a <script> tag in index.html.
  */
 
 // ============================================================
@@ -32,30 +32,68 @@ const CLASS_COLOR = { red: '#ff1744', green: '#00c853', 'traffic-light': '#2979f
 const INPUT_SIZE  = 640;      // model input (letterboxed square)
 const CONF_THRESH = 0.35;     // detection confidence threshold
 const IOU_THRESH  = 0.45;     // NMS IoU threshold
-const INFER_EVERY_MS = 180;   // throttle inference (frames may arrive faster than this)
-const GREEN_SPEAK_COOLDOWN_MS = 4000;
+const INFER_EVERY_MS = 150;   // MINIMUM gap between inferences. Inference runs in
+                              // a Web Worker and inferBusy already prevents overlap,
+                              // so this is just a floor to stop a fast device pegging
+                              // a core at 100%. On a slow device where one inference
+                              // takes longer than this, inferBusy paces it instead
+                              // and this floor never bites. Watch the "…ms" in the
+                              // HUD: that's the real per-inference cost, and the
+                              // detection overlay lags the live video by roughly
+                              // that much (plus this floor). If it's high, the fix
+                              // is faster inference (WebGPU / smaller model), NOT a
+                              // lower floor here.
 const RED_SPEAK_COOLDOWN_MS = 6000;   // less frequent than green -- it's a "keep waiting" reminder, not new info
+
+// Flashing green-man detection (see handleGuidance for the tracking logic).
+// Window covers roughly the last 2-3 seconds of inference results; needs a
+// few observed transitions before confidently calling it "flashing" rather
+// than a single missed/noisy frame.
+const FLASH_HISTORY_WINDOW = 12;
+const FLASH_MIN_TRANSITIONS = 3;
 
 // ============================================================
 // State
 // ============================================================
-let session = null;
+let worker = null;            // inference.worker.js — runs the model off the main thread
+let workerReady = false;      // true once the worker has loaded the model
+let inferBusy = false;        // true while the worker is mid-inference (one at a time)
 let frameCanvas, overlay, frameCtx, octx;
 let preCanvas, preCtx;        // offscreen canvas for letterbox pre-processing
 let latestDetections = [];
-let latestFrameImg = null;    // most recent decoded ESP32 frame (Image element)
+let latestFrameImg = null;    // most recent decoded camera frame (Image element)
+let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop guard)
+let pendingB64 = null;        // newest frame that arrived while a decode was in flight
+
+// Server-side crossing perception (/api/infer -- dotted-line corridor +
+// light-state reading via segmentation model). Runs independently of, and
+// in parallel with, the client-side pedestrian.onnx inference above -- this
+// ADDS dotted-line corridor guidance and a more accurate flashing-light
+// read; it does not replace the existing traffic-light-post detection used
+// during SCANNING.
+let latestFrameB64 = null;
+let crossingInferInFlight = false;
+let lastCrossingInferAt = 0;
+let noDashStreak = 0;
+const CROSSING_INFER_INTERVAL_MS = 200;   // separate throttle from the onnx worker inference
+const END_NO_DASH_FRAMES = 6;             // consecutive no-dash frames before treating it as "corridor ran out"
+const END_LIGHT_AREA_FRAC = 0.02;         // light this big in frame => plausibly at the far side
 let started = false;
 let modelStatus = 'idle';
-let lastGreenSpeakAt = 0;
 let lastRedSpeakAt = 0;
+let greenFlashHistory = [];  // rolling true/false history of green detection, most recent last
 let lastInferAt = 0;
+let lastInferMs = 0;          // last inference wall-time (ms), for the HUD
+let backend = '';             // execution provider in use: 'webgpu' or 'wasm'
 let fps = 0, lastFrameTs = 0;
 
-// onnxruntime-web: fetch the wasm binaries from the CDN
-if (window.ort) {
-    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/';
-    ort.env.wasm.numThreads = 1;
-}
+// onnxruntime-web runs inside inference.worker.js, not on this (main) thread.
+// It's self-hosted under public/vendor/onnxruntime/ (NOT a CDN) so the model
+// loads with no internet -- important when the glasses run on a laptop hotspot
+// with no upstream link. That dir holds the WebGPU build, which bundles both
+// the WebGPU (GPU) and WASM (CPU) execution providers. Path is passed to the
+// worker in the 'load' message below.
+const ORT_WASM_PATHS = 'vendor/onnxruntime/';
 
 // ============================================================
 // Public entry points
@@ -77,7 +115,7 @@ window.addEventListener('load', () => {
 // ============================================================
 // Model bootstrap (no camera acquisition here — frames come from ESP32)
 // ============================================================
-async function startCameraAI() {
+function startCameraAI() {
     if (started) return;
     started = true;
 
@@ -93,27 +131,68 @@ async function startCameraAI() {
 
     modelStatus = 'loading-model';
     setContext('Loading detection model…');
-    try {
-        session = await ort.InferenceSession.create(MODEL_URL, {
-            executionProviders: ['wasm'],
-            graphOptimizationLevel: 'all'
-        });
-        modelStatus = 'waiting-esp32';
-        setContext('Model ready. Waiting for glasses camera feed…');
-        window.navassist.debugLog && window.navassist.debugLog(
-            'Model loaded. in=' + session.inputNames + ' out=' + session.outputNames);
-    } catch (e) {
-        modelStatus = 'model-error';
-        setContext('Model failed to load (' + e.message + '). Is models/pedestrian.onnx present?');
-        window.navassist.debugLog && window.navassist.debugLog('Model load error: ' + e.message);
-        return;
-    }
 
-    requestAnimationFrame(renderLoop);   // draw overlay every frame (smooth)
+    // Spin up the inference worker and have it load the model. The worker does
+    // all the ONNX work; this thread only pre-processes frames and draws.
+    worker = new Worker('js/inference.worker.js');
+    worker.onmessage = handleWorkerMessage;
+    worker.onerror = (e) => {
+        modelStatus = 'model-error';
+        setContext('Inference worker failed to start (' + (e.message || 'unknown error') + ').');
+        window.navassist.debugLog && window.navassist.debugLog('Worker onerror: ' + (e.message || e.filename));
+    };
+    // Model path must be absolute — a relative URL would resolve against the
+    // worker script's location (js/), not the app root.
+    worker.postMessage({
+        type: 'load',
+        // Both must be absolute — a relative URL would resolve against the
+        // worker script's location (js/), not the app root.
+        modelUrl: new URL(MODEL_URL, location.href).href,
+        wasmPaths: new URL(ORT_WASM_PATHS, location.href).href,
+        numThreads: 1,
+        // Prefer the GPU (WebGPU); fall back to CPU (WASM) on devices/browsers
+        // that lack it. NOTE: WebGPU needs a secure context — it's only offered
+        // over HTTPS or on localhost, so an http://<lan-ip> page will fall back
+        // to WASM even on a WebGPU-capable phone.
+        providers: ['webgpu', 'wasm']
+    });
+    // renderLoop starts once the worker signals 'ready' (see handleWorkerMessage).
+}
+
+// Messages coming back from inference.worker.js.
+function handleWorkerMessage(e) {
+    const msg = e.data;
+    switch (msg.type) {
+        case 'ready':
+            workerReady = true;
+            backend = msg.backend || '?';   // 'webgpu' or 'wasm' — shown in the HUD
+            modelStatus = 'waiting-esp32';
+            setContext('Model ready (' + backend + '). Waiting for glasses camera feed…');
+            requestAnimationFrame(renderLoop);   // draw overlay every frame (smooth)
+            break;
+        case 'result':
+            // One inference finished: free the worker and act on the detections.
+            inferBusy = false;
+            lastInferMs = msg.inferMs || 0;
+            latestDetections = msg.detections || [];
+            handleGuidance(latestDetections);
+            break;
+        case 'error':
+            inferBusy = false;
+            if (!workerReady) {   // failed during model load, not a per-frame hiccup
+                modelStatus = 'model-error';
+                setContext('Model failed to load (' + msg.message + '). Is models/pedestrian.onnx present?');
+            }
+            window.navassist.debugLog && window.navassist.debugLog('Worker error: ' + msg.message);
+            break;
+        case 'log':
+            window.navassist.debugLog && window.navassist.debugLog(msg.message);
+            break;
+    }
 }
 
 // ============================================================
-// ESP32 frame ingestion — called by app.js on every 'camera/image' message
+// Camera frame ingestion — called by app.js on every 'camera/image' message
 // ============================================================
 function handleCameraFrame(payload) {
     // Payload is base64 JPEG per README. Handle both a raw string and an
@@ -121,6 +200,26 @@ function handleCameraFrame(payload) {
     const b64 = typeof payload === 'string' ? payload : (payload.image || payload.data || payload.frame);
     if (!b64) return;
 
+    latestFrameB64 = b64;
+    maybeRunCrossingInfer();
+
+    // Frame-drop guard: only ever decode ONE frame at a time. If a decode is
+    // already running, stash just the newest frame and drop everything that
+    // arrived in between -- we only care about the latest. Without this, a
+    // camera that sends frames faster than the main thread can decode/draw
+    // them (the Pi + Camera Module v3 does, unlike the old ~1fps ESP32-CAM)
+    // builds an ever-growing backlog and the on-screen feed falls further and
+    // further behind reality. That's the "laggy only through the webserver"
+    // symptom: the camera is fine, the browser consumer just can't keep up.
+    if (decodeInFlight) {
+        pendingB64 = b64;
+        return;
+    }
+    decodeFrame(b64);
+}
+
+function decodeFrame(b64) {
+    decodeInFlight = true;
     const img = new Image();
     img.onload = () => {
         if (frameCanvas.width !== img.width || frameCanvas.height !== img.height) {
@@ -133,35 +232,136 @@ function handleCameraFrame(payload) {
         latestFrameImg = img;
         if (modelStatus === 'waiting-esp32') modelStatus = 'ready';
         maybeRunInference();
+        onDecodeSettled();
     };
     img.onerror = () => {
         window.navassist.debugLog && window.navassist.debugLog('Bad frame: failed to decode JPEG');
+        onDecodeSettled();
     };
     img.src = 'data:image/jpeg;base64,' + b64;
+}
+
+// After a decode finishes (success or failure), immediately pick up the newest
+// frame that queued up while we were busy, if any. This keeps the display as
+// fresh as possible while still never running two decodes concurrently.
+function onDecodeSettled() {
+    decodeInFlight = false;
+    if (pendingB64 !== null) {
+        const next = pendingB64;
+        pendingB64 = null;
+        decodeFrame(next);
+    }
+}
+
+// ============================================================
+// Server-side crossing perception (dotted-line corridor + light state)
+// ============================================================
+async function maybeRunCrossingInfer() {
+    if (crossingInferInFlight || !latestFrameB64) return;
+    const now = performance.now();
+    if (now - lastCrossingInferAt < CROSSING_INFER_INTERVAL_MS) return;
+    lastCrossingInferAt = now;
+    crossingInferInFlight = true;
+
+    try {
+        const res = await fetch('/api/infer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: 'data:image/jpeg;base64,' + latestFrameB64 })
+        });
+        if (res.ok) {
+            const result = await res.json();
+            if (result && result.w) handleCrossingPerception(result);
+        }
+    } catch (e) {
+        // Server-side perception is an ADDITION, not a dependency -- if it's
+        // slow, down, or the network drops, the existing client-side
+        // pipeline (traffic-light-post detection, phone-compass drift
+        // correction) keeps working on its own. Fail silently, don't block
+        // or retry-storm.
+        window.navassist.debugLog && window.navassist.debugLog('Crossing infer error: ' + e.message);
+    } finally {
+        crossingInferInFlight = false;
+    }
+}
+
+// Routes server-side perception into app.js's existing, already
+// safety-gated callbacks -- this file never decides or speaks on its own
+// behalf, same pattern as every other detection path in this file.
+function handleCrossingPerception(result) {
+    const state = window.navassist.currentState && window.navassist.currentState();
+    const STATES = window.navassist.STATES;
+    if (!state || !STATES) return;
+
+    // --- Light state while WAITING: more accurate than blink-counting,
+    // since it reads green/red presence independently per frame instead of
+    // needing a rolling history window first. RED is intentionally left to
+    // the existing pedestrian.onnx-driven "still red" reminder, so there's
+    // only one code path speaking that reminder, not two.
+    if (state === STATES.WAITING && result.light) {
+        const frameW = result.w || 1;
+        const lightDir = getDirection(((result.light.box[0] + result.light.box[2]) / 2) / frameW);
+        if (result.light.state === 'GREEN') {
+            window.navassist.onGreenDetected && window.navassist.onGreenDetected(lightDir);
+        } else if (result.light.state === 'GREENRED') {
+            window.navassist.onGreenFlashing && window.navassist.onGreenFlashing(lightDir);
+        }
+    }
+
+    // --- Corridor (dotted-line) haptic guidance + vision-based arrival
+    // signal, only relevant while actually crossing.
+    if (state === STATES.CROSSING) {
+        if (result.corridor && result.corridor.has) {
+            noDashStreak = 0;
+            // ang ~ -90 = straight ahead (up). Same threshold convention as
+            // the original crossing.js dirWord() logic.
+            const ang = result.corridor.angleDeg;
+            let corridorDir = 'CENTRE';
+            if (ang > -65 && ang <= 0) corridorDir = 'RIGHT';
+            else if (ang < -115 && ang >= -180) corridorDir = 'LEFT';
+            window.navassist.onCorridorDirection && window.navassist.onCorridorDirection(corridorDir);
+        } else {
+            noDashStreak++;
+        }
+
+        const lightBig = result.light && result.light.areaFrac >= END_LIGHT_AREA_FRAC;
+        if (noDashStreak >= END_NO_DASH_FRAMES && (lightBig || !result.light)) {
+            // Corridor ran out AND the light looks close/gone -- plausible
+            // sign of reaching the far side. This is a SIGNAL, not a
+            // decision: it feeds into the SAME tap-confirmation gate GPS
+            // distance already triggers (promptArrivalConfirmation), it
+            // does not complete the crossing on its own.
+            window.navassist.onVisionArrivalSignal && window.navassist.onVisionArrivalSignal();
+        }
+    }
 }
 
 // ============================================================
 // Inference (throttled, triggered per incoming frame)
 // ============================================================
-async function maybeRunInference() {
-    if (!session || !latestFrameImg) return;
+// Pre-process the current frame on this thread (it needs the DOM canvas) and
+// ship the resulting float buffer to the worker, which runs the model and the
+// box decode. At most one inference is in flight at a time (inferBusy) so a
+// slow model can't build a queue -- newer frames just wait for the next slot.
+function maybeRunInference() {
+    if (!workerReady || !latestFrameImg || inferBusy) return;
     const now = performance.now();
     if (now - lastInferAt < INFER_EVERY_MS) return;
     lastInferAt = now;
 
-    try {
-        const pre = preprocess();
-        const feeds = {}; feeds[session.inputNames[0]] = pre.tensor;
-        const results = await session.run(feeds);
-        const out = results[session.outputNames[0]];
-        latestDetections = postprocess(out, pre);
-        handleGuidance(latestDetections);
-    } catch (e) {
-        window.navassist.debugLog && window.navassist.debugLog('Inference error: ' + e.message);
-    }
+    const pre = preprocess();
+    inferBusy = true;
+    // Transfer the buffer (zero-copy) rather than cloning it across threads.
+    worker.postMessage({
+        type: 'infer',
+        data: pre.data.buffer,
+        dims: [1, 3, INPUT_SIZE, INPUT_SIZE],
+        scale: pre.scale, padX: pre.padX, padY: pre.padY,
+        confThresh: CONF_THRESH, iouThresh: IOU_THRESH
+    }, [pre.data.buffer]);
 }
 
-// Letterbox the current ESP32 frame into a 640x640 CHW float tensor.
+// Letterbox the current frame into a 640x640 CHW float buffer for the model.
 function preprocess() {
     const iw = latestFrameImg.width, ih = latestFrameImg.height, S = INPUT_SIZE;
     const scale = Math.min(S / iw, S / ih);
@@ -180,56 +380,8 @@ function preprocess() {
         data[i + area]     = rgba[i * 4 + 1] / 255;  // G
         data[i + 2 * area] = rgba[i * 4 + 2] / 255;  // B
     }
-    return { tensor: new ort.Tensor('float32', data, [1, 3, S, S]), scale, padX, padY };
-}
-
-// Decode YOLO output [1, 4+nc, 8400] -> boxes in original-frame pixels, then NMS.
-function postprocess(out, pre) {
-    const dims = out.dims;            // [1, 7, 8400]
-    const num  = dims[2];
-    const nCls = dims[1] - 4;
-    const d    = out.data;
-    const { scale, padX, padY } = pre;
-
-    const boxes = [];
-    for (let a = 0; a < num; a++) {
-        let best = 0, bestC = 0;
-        for (let c = 0; c < nCls; c++) {
-            const s = d[(4 + c) * num + a];
-            if (s > best) { best = s; bestC = c; }
-        }
-        if (best < CONF_THRESH) continue;
-        const cx = d[a], cy = d[num + a], w = d[2 * num + a], h = d[3 * num + a];
-        boxes.push({
-            x1: (cx - w / 2 - padX) / scale,
-            y1: (cy - h / 2 - padY) / scale,
-            x2: (cx + w / 2 - padX) / scale,
-            y2: (cy + h / 2 - padY) / scale,
-            score: best, cls: bestC
-        });
-    }
-    return nms(boxes, IOU_THRESH);
-}
-
-function nms(boxes, iouThr) {
-    boxes.sort((a, b) => b.score - a.score);
-    const keep = [], dead = new Array(boxes.length).fill(false);
-    for (let i = 0; i < boxes.length; i++) {
-        if (dead[i]) continue;
-        keep.push(boxes[i]);
-        for (let j = i + 1; j < boxes.length; j++) {
-            if (!dead[j] && boxes[i].cls === boxes[j].cls && iou(boxes[i], boxes[j]) > iouThr) dead[j] = true;
-        }
-    }
-    return keep;
-}
-
-function iou(a, b) {
-    const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
-    const x2 = Math.min(a.x2, b.x2), y2 = Math.min(a.y2, b.y2);
-    const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-    const areaA = (a.x2 - a.x1) * (a.y2 - a.y1), areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
-    return inter / (areaA + areaB - inter + 1e-6);
+    // The YOLO output decode + NMS live in the worker now (postprocess there).
+    return { data, scale, padX, padY };
 }
 
 // ============================================================
@@ -279,7 +431,7 @@ function drawOverlay(dets) {
     // Small status HUD (top-left)
     octx.font = `${Math.max(12, Math.round(W * 0.016))}px monospace`;
     octx.fillStyle = 'rgba(0,0,0,0.55)';
-    const hud = `${modelStatus}  ${dets.length} det  ${fps.toFixed(0)} fps`;
+    const hud = `${modelStatus}  ${backend}  ${dets.length} det  ${fps.toFixed(0)} fps  ${lastInferMs.toFixed(0)}ms`;
     const hw = octx.measureText(hud).width;
     octx.fillRect(6, 6, hw + 12, 22);
     octx.fillStyle = '#0f0';
@@ -369,16 +521,42 @@ function handleGuidance(dets) {
     const direction = getDirection(cx / frameW);
 
     const greens = dets.filter(d => CLASSES[d.cls] === 'green');
+    const greenDetectedThisFrame = greens.length > 0;
+
+    // Flashing-light detection: a physically flashing green man produces
+    // gaps in detection (off during the "off" phase of the blink) that a
+    // steady green never does. Track the last N frames as a rolling
+    // true/false history and count how many times it flips -- no new model
+    // training needed, this is pure temporal pattern tracking on top of the
+    // EXISTING 'green' class. Singapore crossings typically flash green for
+    // the last ~10s before turning red (per LTA/GMCD research), rather than
+    // showing a numeric countdown, so this covers the common case.
+    greenFlashHistory.push(greenDetectedThisFrame);
+    if (greenFlashHistory.length > FLASH_HISTORY_WINDOW) greenFlashHistory.shift();
+
     if (greens.length) {
-        const now = Date.now();
-        if (now - lastGreenSpeakAt > GREEN_SPEAK_COOLDOWN_MS) {
-            lastGreenSpeakAt = now;
-            const g = greens.reduce((a, b) => (a.score > b.score ? a : b));
-            const gdir = getDirection(((g.x1 + g.x2) / 2) / frameW);
-            window.navassist.speak && window.navassist.speak(
-                gdir === 'CENTRE' ? 'Green man ahead. You may cross.' : `Green man to your ${gdir.toLowerCase()}.`);
+        const g = greens.reduce((a, b) => (a.score > b.score ? a : b));
+        const gdir = getDirection(((g.x1 + g.x2) / 2) / frameW);
+
+        // Directional haptic: buzz the side the green man is on. Has its own
+        // cooldown inside app.js, so it's safe to call every frame here.
+        window.navassist.onGreenDirection && window.navassist.onGreenDirection(gdir);
+
+        if (isGreenFlashing()) {
+            // Signal is ending soon -- do NOT invite the user to cross.
+            // app.js decides exactly what to say/do with this; ai.js only
+            // reports the pattern it observed.
+            window.navassist.onGreenFlashing && window.navassist.onGreenFlashing(gdir);
+        } else {
+            // Speech for "green man detected, you may cross" now lives
+            // entirely in app.js's onGreenDetected -- previously this also
+            // spoke here, causing two overlapping/back-to-back messages for
+            // the same event. Direction is passed through so app.js can
+            // build ONE message that includes both the direction and the
+            // "double tap to confirm" instruction, instead of splitting
+            // that across two speak() calls.
+            window.navassist.onGreenDetected && window.navassist.onGreenDetected(gdir);
         }
-        window.navassist.onGreenDetected && window.navassist.onGreenDetected();
     }
 
     // Red man: only relevant while WAITING (i.e. user already confirmed a
@@ -401,6 +579,20 @@ function handleGuidance(dets) {
         if (boxH > 0.4) window.navassist.onArrived && window.navassist.onArrived();
         else window.navassist.onDirectionDecided && window.navassist.onDirectionDecided(direction);
     }
+}
+
+// Counts on/off transitions in the recent green-detection history. A
+// physically flashing light produces multiple flips within a short window;
+// a steady light produces zero or one (e.g. the initial detection itself).
+// Requires a FULL window of data before returning true, so a partially-
+// filled history (e.g. right after WAITING begins) can't false-positive.
+function isGreenFlashing() {
+    if (greenFlashHistory.length < FLASH_HISTORY_WINDOW) return false;
+    let transitions = 0;
+    for (let i = 1; i < greenFlashHistory.length; i++) {
+        if (greenFlashHistory[i] !== greenFlashHistory[i - 1]) transitions++;
+    }
+    return transitions >= FLASH_MIN_TRANSITIONS;
 }
 
 function getDirection(normX) {

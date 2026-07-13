@@ -1,0 +1,6 @@
+# Integrity-critical binaries: never apply text/EOL conversion (would corrupt them)
+*.wasm binary
+*.onnx binary
+
+# Vendored onnxruntime build: keep pristine, no line-ending normalization
+public/vendor/onnxruntime/** -text

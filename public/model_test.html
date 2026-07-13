@@ -27,7 +27,7 @@ const MODEL_URL   = 'models/pedestrian.onnx';   // relative to wherever this fil
 const CLASSES     = ['red', 'green', 'traffic-light'];
 const CLASS_COLOR = { red: '#ff1744', green: '#00c853', 'traffic-light': '#2979ff' };
 const INPUT_SIZE  = 640;
-const CONF_THRESH = 0.35;
+const CONF_THRESH = 0.08;
 const IOU_THRESH  = 0.45;
 
 let session = null;
