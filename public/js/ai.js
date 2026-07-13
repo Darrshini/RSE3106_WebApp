@@ -45,6 +45,13 @@ const INFER_EVERY_MS = 150;   // MINIMUM gap between inferences. Inference runs 
                               // lower floor here.
 const RED_SPEAK_COOLDOWN_MS = 6000;   // less frequent than green -- it's a "keep waiting" reminder, not new info
 
+// Flashing green-man detection (see handleGuidance for the tracking logic).
+// Window covers roughly the last 2-3 seconds of inference results; needs a
+// few observed transitions before confidently calling it "flashing" rather
+// than a single missed/noisy frame.
+const FLASH_HISTORY_WINDOW = 12;
+const FLASH_MIN_TRANSITIONS = 3;
+
 // ============================================================
 // State
 // ============================================================
@@ -57,9 +64,24 @@ let latestDetections = [];
 let latestFrameImg = null;    // most recent decoded camera frame (Image element)
 let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop guard)
 let pendingB64 = null;        // newest frame that arrived while a decode was in flight
+
+// Server-side crossing perception (/api/infer -- dotted-line corridor +
+// light-state reading via segmentation model). Runs independently of, and
+// in parallel with, the client-side pedestrian.onnx inference above -- this
+// ADDS dotted-line corridor guidance and a more accurate flashing-light
+// read; it does not replace the existing traffic-light-post detection used
+// during SCANNING.
+let latestFrameB64 = null;
+let crossingInferInFlight = false;
+let lastCrossingInferAt = 0;
+let noDashStreak = 0;
+const CROSSING_INFER_INTERVAL_MS = 200;   // separate throttle from the onnx worker inference
+const END_NO_DASH_FRAMES = 6;             // consecutive no-dash frames before treating it as "corridor ran out"
+const END_LIGHT_AREA_FRAC = 0.02;         // light this big in frame => plausibly at the far side
 let started = false;
 let modelStatus = 'idle';
 let lastRedSpeakAt = 0;
+let greenFlashHistory = [];  // rolling true/false history of green detection, most recent last
 let lastInferAt = 0;
 let lastInferMs = 0;          // last inference wall-time (ms), for the HUD
 let backend = '';             // execution provider in use: 'webgpu' or 'wasm'
@@ -178,6 +200,9 @@ function handleCameraFrame(payload) {
     const b64 = typeof payload === 'string' ? payload : (payload.image || payload.data || payload.frame);
     if (!b64) return;
 
+    latestFrameB64 = b64;
+    maybeRunCrossingInfer();
+
     // Frame-drop guard: only ever decode ONE frame at a time. If a decode is
     // already running, stash just the newest frame and drop everything that
     // arrived in between -- we only care about the latest. Without this, a
@@ -225,6 +250,89 @@ function onDecodeSettled() {
         const next = pendingB64;
         pendingB64 = null;
         decodeFrame(next);
+    }
+}
+
+// ============================================================
+// Server-side crossing perception (dotted-line corridor + light state)
+// ============================================================
+async function maybeRunCrossingInfer() {
+    if (crossingInferInFlight || !latestFrameB64) return;
+    const now = performance.now();
+    if (now - lastCrossingInferAt < CROSSING_INFER_INTERVAL_MS) return;
+    lastCrossingInferAt = now;
+    crossingInferInFlight = true;
+
+    try {
+        const res = await fetch('/api/infer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: 'data:image/jpeg;base64,' + latestFrameB64 })
+        });
+        if (res.ok) {
+            const result = await res.json();
+            if (result && result.w) handleCrossingPerception(result);
+        }
+    } catch (e) {
+        // Server-side perception is an ADDITION, not a dependency -- if it's
+        // slow, down, or the network drops, the existing client-side
+        // pipeline (traffic-light-post detection, phone-compass drift
+        // correction) keeps working on its own. Fail silently, don't block
+        // or retry-storm.
+        window.navassist.debugLog && window.navassist.debugLog('Crossing infer error: ' + e.message);
+    } finally {
+        crossingInferInFlight = false;
+    }
+}
+
+// Routes server-side perception into app.js's existing, already
+// safety-gated callbacks -- this file never decides or speaks on its own
+// behalf, same pattern as every other detection path in this file.
+function handleCrossingPerception(result) {
+    const state = window.navassist.currentState && window.navassist.currentState();
+    const STATES = window.navassist.STATES;
+    if (!state || !STATES) return;
+
+    // --- Light state while WAITING: more accurate than blink-counting,
+    // since it reads green/red presence independently per frame instead of
+    // needing a rolling history window first. RED is intentionally left to
+    // the existing pedestrian.onnx-driven "still red" reminder, so there's
+    // only one code path speaking that reminder, not two.
+    if (state === STATES.WAITING && result.light) {
+        const frameW = result.w || 1;
+        const lightDir = getDirection(((result.light.box[0] + result.light.box[2]) / 2) / frameW);
+        if (result.light.state === 'GREEN') {
+            window.navassist.onGreenDetected && window.navassist.onGreenDetected(lightDir);
+        } else if (result.light.state === 'GREENRED') {
+            window.navassist.onGreenFlashing && window.navassist.onGreenFlashing(lightDir);
+        }
+    }
+
+    // --- Corridor (dotted-line) haptic guidance + vision-based arrival
+    // signal, only relevant while actually crossing.
+    if (state === STATES.CROSSING) {
+        if (result.corridor && result.corridor.has) {
+            noDashStreak = 0;
+            // ang ~ -90 = straight ahead (up). Same threshold convention as
+            // the original crossing.js dirWord() logic.
+            const ang = result.corridor.angleDeg;
+            let corridorDir = 'CENTRE';
+            if (ang > -65 && ang <= 0) corridorDir = 'RIGHT';
+            else if (ang < -115 && ang >= -180) corridorDir = 'LEFT';
+            window.navassist.onCorridorDirection && window.navassist.onCorridorDirection(corridorDir);
+        } else {
+            noDashStreak++;
+        }
+
+        const lightBig = result.light && result.light.areaFrac >= END_LIGHT_AREA_FRAC;
+        if (noDashStreak >= END_NO_DASH_FRAMES && (lightBig || !result.light)) {
+            // Corridor ran out AND the light looks close/gone -- plausible
+            // sign of reaching the far side. This is a SIGNAL, not a
+            // decision: it feeds into the SAME tap-confirmation gate GPS
+            // distance already triggers (promptArrivalConfirmation), it
+            // does not complete the crossing on its own.
+            window.navassist.onVisionArrivalSignal && window.navassist.onVisionArrivalSignal();
+        }
     }
 }
 
@@ -413,6 +521,19 @@ function handleGuidance(dets) {
     const direction = getDirection(cx / frameW);
 
     const greens = dets.filter(d => CLASSES[d.cls] === 'green');
+    const greenDetectedThisFrame = greens.length > 0;
+
+    // Flashing-light detection: a physically flashing green man produces
+    // gaps in detection (off during the "off" phase of the blink) that a
+    // steady green never does. Track the last N frames as a rolling
+    // true/false history and count how many times it flips -- no new model
+    // training needed, this is pure temporal pattern tracking on top of the
+    // EXISTING 'green' class. Singapore crossings typically flash green for
+    // the last ~10s before turning red (per LTA/GMCD research), rather than
+    // showing a numeric countdown, so this covers the common case.
+    greenFlashHistory.push(greenDetectedThisFrame);
+    if (greenFlashHistory.length > FLASH_HISTORY_WINDOW) greenFlashHistory.shift();
+
     if (greens.length) {
         const g = greens.reduce((a, b) => (a.score > b.score ? a : b));
         const gdir = getDirection(((g.x1 + g.x2) / 2) / frameW);
@@ -421,13 +542,21 @@ function handleGuidance(dets) {
         // cooldown inside app.js, so it's safe to call every frame here.
         window.navassist.onGreenDirection && window.navassist.onGreenDirection(gdir);
 
-        // Speech for "green man detected, you may cross" now lives entirely
-        // in app.js's onGreenDetected -- previously this also spoke here,
-        // causing two overlapping/back-to-back messages for the same event.
-        // Direction is passed through so app.js can build ONE message that
-        // includes both the direction and the "double tap to confirm"
-        // instruction, instead of splitting that across two speak() calls.
-        window.navassist.onGreenDetected && window.navassist.onGreenDetected(gdir);
+        if (isGreenFlashing()) {
+            // Signal is ending soon -- do NOT invite the user to cross.
+            // app.js decides exactly what to say/do with this; ai.js only
+            // reports the pattern it observed.
+            window.navassist.onGreenFlashing && window.navassist.onGreenFlashing(gdir);
+        } else {
+            // Speech for "green man detected, you may cross" now lives
+            // entirely in app.js's onGreenDetected -- previously this also
+            // spoke here, causing two overlapping/back-to-back messages for
+            // the same event. Direction is passed through so app.js can
+            // build ONE message that includes both the direction and the
+            // "double tap to confirm" instruction, instead of splitting
+            // that across two speak() calls.
+            window.navassist.onGreenDetected && window.navassist.onGreenDetected(gdir);
+        }
     }
 
     // Red man: only relevant while WAITING (i.e. user already confirmed a
@@ -450,6 +579,20 @@ function handleGuidance(dets) {
         if (boxH > 0.4) window.navassist.onArrived && window.navassist.onArrived();
         else window.navassist.onDirectionDecided && window.navassist.onDirectionDecided(direction);
     }
+}
+
+// Counts on/off transitions in the recent green-detection history. A
+// physically flashing light produces multiple flips within a short window;
+// a steady light produces zero or one (e.g. the initial detection itself).
+// Requires a FULL window of data before returning true, so a partially-
+// filled history (e.g. right after WAITING begins) can't false-positive.
+function isGreenFlashing() {
+    if (greenFlashHistory.length < FLASH_HISTORY_WINDOW) return false;
+    let transitions = 0;
+    for (let i = 1; i < greenFlashHistory.length; i++) {
+        if (greenFlashHistory[i] !== greenFlashHistory[i - 1]) transitions++;
+    }
+    return transitions >= FLASH_MIN_TRANSITIONS;
 }
 
 function getDirection(normX) {

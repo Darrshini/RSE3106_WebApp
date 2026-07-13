@@ -43,6 +43,7 @@ const STATES = {
     WAITING:          'WAITING',
     CONFIRM_CROSSING: 'CONFIRM_CROSSING',
     CROSSING:         'CROSSING',
+    CONFIRM_ARRIVAL:  'CONFIRM_ARRIVAL',
     COMPLETED:        'COMPLETED',
     LOST_CONNECTION:  'LOST_CONNECTION'
 };
@@ -61,6 +62,7 @@ const GESTURE_RULES = {
     [STATES.READY]:            { single_tap: 'START_SCAN' },
     [STATES.CONFIRM_TARGET]:   { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
     [STATES.CONFIRM_CROSSING]: { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
+    [STATES.CONFIRM_ARRIVAL]:  { single_tap: 'CONFIRM_YES' },
     [STATES.COMPLETED]:        { single_tap: 'RESET' }
 };
 
@@ -136,6 +138,13 @@ function handleConnectionEvent(payload) {
         transitionTo(STATES.READY);
     } else if (event === 'esp32_disconnected') {
         updateConnectionStatus(false);
+        if (pendingConfirmation) {
+            pendingConfirmation = null;
+            if (pendingConfirmationTimerId) {
+                clearTimeout(pendingConfirmationTimerId);
+                pendingConfirmationTimerId = null;
+            }
+        }
         if (currentState !== STATES.IDLE) {
             speak('Glasses disconnected. Please check the connection.', true);
             transitionTo(STATES.LOST_CONNECTION);
@@ -221,7 +230,7 @@ function checkHeadingDrift() {
         const now = Date.now();
         if (Math.abs(drift) > SIGNIFICANT_TURN_DEG && now - lastTurnWarningAt > TURN_WARNING_COOLDOWN_MS) {
             lastTurnWarningAt = now;
-            speak('You have turned away. Listen for the voice directions to re-orient toward the crossing.');
+            speak('You have turned away. Follow the haptic feedback to re-orient toward the crossing.');
             navigatingStartHeading = currentHeading;  // reset reference so this only re-fires after another significant turn
         }
     }
@@ -286,17 +295,30 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Called once the user has actually moved far enough, or the fallback timer
-// fires -- whichever happens first. Guards against double-firing.
-function completeCrossing() {
-    if (currentState !== STATES.CROSSING) return;
-    crossingStartHeading = null;
-    crossingStartLocation = null;
+// Fired once the user has moved far enough (GPS) or the fallback timer
+// elapses -- either way, this does NOT complete the crossing automatically
+// anymore. It prompts the user to check for tactile ground indicators with
+// their cane and explicitly confirm before the crossing is marked complete.
+// This exists specifically to prevent a false "crossing complete" while the
+// user might still be halfway across -- GPS alone isn't trusted to make
+// that call on its own.
+function promptArrivalConfirmation() {
+    if (currentState !== STATES.CROSSING) return;  // already prompted or moved on -- avoid double-firing
     if (crossingFallbackTimerId) {
         clearTimeout(crossingFallbackTimerId);
         crossingFallbackTimerId = null;
     }
-    transitionTo(STATES.COMPLETED, 'Crossing complete. Tap once to scan again.');
+    transitionTo(STATES.CONFIRM_ARRIVAL,
+        'You may have reached the other side. If you can feel the tactile ground indicators with your cane, tap once to confirm you have crossed safely.');
+}
+
+// Only called after the user has explicitly confirmed (through the
+// double-confirmation flow) that they feel the tactile indicators.
+function completeCrossing() {
+    if (currentState !== STATES.CONFIRM_ARRIVAL) return;
+    crossingStartHeading = null;
+    crossingStartLocation = null;
+    transitionTo(STATES.COMPLETED, 'Crossing complete. You are safely across. Tap once to scan again.');
 }
 
 function startGpsTracking() {
@@ -332,7 +354,7 @@ function startGpsTracking() {
                 );
                 debugLog('Crossing distance moved: ' + moved.toFixed(1) + 'm');
                 if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
-                    completeCrossing();
+                    promptArrivalConfirmation();
                 }
             }
         },
@@ -360,6 +382,55 @@ async function resolveJunction() {
     }
 }
 
+// Overpass API endpoints, tried in order -- the public instance can be slow
+// or rate-limited under load, so we fall through to mirrors rather than
+// failing outright on the first one.
+const OVERPASS_ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter'
+];
+const CROSSING_SEARCH_RADIUS_M = 100;
+const ROAD_NAME_SEARCH_RADIUS_M = 20;   // small radius anchored on the crossing itself
+
+async function overpassQuery(query) {
+    let lastError = null;
+    for (const endpoint of OVERPASS_ENDPOINTS) {
+        try {
+            const res = await fetch(endpoint, {
+                method: 'POST',
+                body: 'data=' + encodeURIComponent(query)
+            });
+            if (!res.ok) { lastError = new Error('HTTP ' + res.status); continue; }
+            const data = await res.json();
+            return data;
+        } catch (e) {
+            lastError = e;
+            // try the next mirror
+        }
+    }
+    throw lastError || new Error('All Overpass endpoints failed');
+}
+
+// Finds the name of whatever road the crossing sits on, by querying a small
+// radius directly around the crossing's own coordinates (not the user's) --
+// a crossing node should be right on top of, or immediately adjacent to,
+// the road way it belongs to.
+async function findRoadNameNear(lat, lon) {
+    try {
+        const query = '[out:json][timeout:10];' +
+            'way(around:' + ROAD_NAME_SEARCH_RADIUS_M + ',' + lat + ',' + lon + ')["highway"]["name"];' +
+            'out tags;';
+        const data = await overpassQuery(query);
+        if (data.elements && data.elements.length && data.elements[0].tags && data.elements[0].tags.name) {
+            return data.elements[0].tags.name;
+        }
+    } catch (e) {
+        debugLog('Road name lookup failed: ' + e.message);
+    }
+    return null;  // caller falls back to a generic name -- never blocks on this
+}
+
 async function resolveJunctionWithGPS() {
     if (currentLocation.accuracyMeters > 30) {
         speak('GPS signal is weak. Please wait or move to an open area.');
@@ -368,26 +439,52 @@ async function resolveJunctionWithGPS() {
     }
 
     try {
-        const url = 'https://maps.googleapis.com/maps/api/place/nearbysearch/json' +
-            '?location=' + currentLocation.latitude + ',' + currentLocation.longitude +
-            '&radius=80&type=traffic_signals' +
-            '&key=' + config.googleMapsApiKey;
+        // Query real OpenStreetMap infrastructure data for signal-controlled
+        // pedestrian crossings -- highway=crossing + crossing=traffic_signals
+        // is the actual OSM tag for exactly this, confirmed against OSM's
+        // own wiki. This replaces the previous Google Places lookup, which
+        // used a "traffic_signals" type that doesn't exist in Google's
+        // Places API at all (it's a business directory, not road
+        // infrastructure) -- that mismatch is what caused nearby stores to
+        // come back instead of crossings.
+        const query = '[out:json][timeout:15];' +
+            'node["highway"="crossing"]["crossing"="traffic_signals"]' +
+            '(around:' + CROSSING_SEARCH_RADIUS_M + ',' +
+            currentLocation.latitude + ',' + currentLocation.longitude + ');' +
+            'out body;';
 
-        const res = await fetch(url);
-        const data = await res.json();
+        const data = await overpassQuery(query);
 
-        if (data.status !== 'OK' || !data.results.length) {
+        if (!data.elements || !data.elements.length) {
+            // No real crossings found nearby. Fail safe: fall back to
+            // camera-only scanning rather than ever guessing or widening
+            // the search blindly -- if GPS is subtly off (right area, wrong
+            // street), presenting a distant or wrong result would be worse
+            // than presenting none.
+            debugLog('No pedestrian crossings found via Overpass within ' + CROSSING_SEARCH_RADIUS_M + 'm');
             resolveJunctionWithCameraOnly();
             return;
         }
 
-        nearbyCrossings = data.results.map(place => ({
-            name: place.name || 'Pedestrian crossing',
+        // Compute distance for every candidate first, sort, then only look
+        // up road names for the closest few -- keeps this fast and limits
+        // how many extra network requests a single scan can trigger.
+        const candidates = data.elements.map(el => ({
+            latitude: el.lat,
+            longitude: el.lon,
             distance: haversineMeters(
                 currentLocation.latitude, currentLocation.longitude,
-                place.geometry.location.lat,
-                place.geometry.location.lng
+                el.lat, el.lon
             )
+        })).sort((a, b) => a.distance - b.distance);
+
+        const topCandidates = candidates.slice(0, 5);
+        const namePromises = topCandidates.map(c => findRoadNameNear(c.latitude, c.longitude));
+        const names = await Promise.all(namePromises);
+
+        nearbyCrossings = topCandidates.map((c, i) => ({
+            name: names[i] || 'a nearby pedestrian crossing',
+            distance: c.distance
         }));
 
         nearbyCrossings.sort((a, b) => a.distance - b.distance);
@@ -477,27 +574,13 @@ window.navassist.onTrafficLightVisible = function(confidence) {
     }
 };
 
-// Audio-only direction guidance while walking toward the traffic light post.
-// Team decision: haptic is reserved for CROSSING only -- this phase uses
-// audio instead (previously haptic-only, silent otherwise). Announces on
-// direction CHANGE, not every frame, with a minimum gap between announcements
-// so it doesn't become constant chatter or flap back and forth on noisy
-// detections. Adjust NAV_SPEAK_COOLDOWN_MS if it feels too chatty or too slow
-// to react once tested on a real walk.
-let lastNavDirection = null;
-let lastNavSpeakAt = 0;
-const NAV_SPEAK_COOLDOWN_MS = 2000;
-
+// Haptic-only direction guidance while walking toward the traffic light post.
+// (Reverted back from audio -- team decided haptic during NAVIGATING after all.)
 window.navassist.onDirectionDecided = function(direction) {
     if (currentState !== STATES.NAVIGATING) return;
-    const now = Date.now();
-    if (direction === lastNavDirection || now - lastNavSpeakAt < NAV_SPEAK_COOLDOWN_MS) return;
-    lastNavDirection = direction;
-    lastNavSpeakAt = now;
-
-    if (direction === 'LEFT')       speak('Slightly left.');
-    else if (direction === 'RIGHT') speak('Slightly right.');
-    else                            speak('Straight ahead.');
+    if (direction === 'LEFT')   sendHaptic('left',  'pulse');
+    if (direction === 'RIGHT')  sendHaptic('right', 'pulse');
+    if (direction === 'CENTRE') sendHaptic('both',  'pulse', 0.3, 200);
 };
 
 window.navassist.onArrived = function() {
@@ -551,6 +634,53 @@ window.navassist.onGreenDirection = function(direction) {
     else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.5, 200);
 };
 
+// Called by ai.js when green is detected but flashing -- i.e. the signal is
+// about to end. Deliberately does NOT invite the user to cross (does not
+// call anything that would transition to CONFIRM_CROSSING) -- stays in
+// WAITING and just warns, so the user waits for the next full green cycle
+// instead of starting to cross on limited/expiring time.
+let lastFlashWarningAt = 0;
+const FLASH_WARNING_COOLDOWN_MS = 4000;
+
+window.navassist.onGreenFlashing = function() {
+    if (currentState !== STATES.WAITING) return;
+    const now = Date.now();
+    if (now - lastFlashWarningAt < FLASH_WARNING_COOLDOWN_MS) return;
+    lastFlashWarningAt = now;
+    speak('The signal is ending soon. Please wait for the next green light.');
+};
+
+// Called by ai.js with dotted-line corridor direction from the server-side
+// segmentation model, while CROSSING. Deliberately shares the SAME cooldown
+// (lastCrossingHapticAt / CROSSING_HAPTIC_COOLDOWN_MS) as the phone-compass
+// heading-drift correction in checkHeadingDrift() -- whichever signal is
+// ready first within a given cooldown window fires, the other is skipped
+// for that window. This means vision-based corridor guidance and compass
+// drift correction never stack or fire competing haptic pulses at once;
+// when the dotted lines are visible they naturally take priority (they
+// update faster than GPS/compass), and compass drift correction still
+// covers moments where the corridor isn't visible (occlusion, etc).
+window.navassist.onCorridorDirection = function(direction) {
+    if (currentState !== STATES.CROSSING) return;
+    const now = Date.now();
+    if (now - lastCrossingHapticAt < CROSSING_HAPTIC_COOLDOWN_MS) return;
+    lastCrossingHapticAt = now;
+
+    if (direction === 'LEFT')       sendHaptic('left',  'pulse', 0.6, 250);
+    else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.6, 250);
+    // CENTRE: already tracking the corridor centreline, no correction needed
+};
+
+// Called by ai.js when the dotted-line corridor runs out AND the light
+// looks close/gone -- a vision-based hint that the user may have reached
+// the far side. This is only a SIGNAL: it feeds into the exact same
+// tap-confirmation gate GPS distance already triggers, it never completes
+// the crossing by itself. Safe to call repeatedly -- promptArrivalConfirmation
+// already guards on currentState === CROSSING internally.
+window.navassist.onVisionArrivalSignal = function() {
+    promptArrivalConfirmation();
+};
+
 // ============================================================
 // Gesture detection -- ENTIRE SCREEN
 // ============================================================
@@ -577,10 +707,88 @@ function handleScreenTap(e) {
     }, TAP_WINDOW_MS);
 }
 
+// ============================================================
+// Double-confirmation safety layer
+// ============================================================
+// Every CONFIRM_YES / CONFIRM_NO decision (choosing a crossing, confirming
+// it's safe to cross, cycling to a different crossing) now requires TWO
+// taps to actually commit. The first tap is echoed back out loud so the
+// user can hear what was detected; only a FOLLOW-UP single tap actually
+// executes it. This exists specifically to catch gesture misdetection --
+// a double-tap misread as a triple-tap, or vice versa -- before it can
+// silently commit to the wrong crossing decision. Given how serious a
+// wrong crossing choice could be, the extra tap is worth it every time.
+let pendingConfirmation = null;
+let pendingConfirmationTimerId = null;
+const PENDING_CONFIRMATION_TIMEOUT_MS = 5000;
+
+const CONFIRMATION_ECHO_MESSAGES = {
+    CONFIRM_TARGET: {
+        CONFIRM_YES: 'You selected: yes, this is my crossing. Tap once more to confirm.',
+        CONFIRM_NO:  'You selected: no, try a different crossing. Tap once more to confirm.'
+    },
+    CONFIRM_CROSSING: {
+        CONFIRM_YES: 'You selected: yes, I will cross now. Tap once more to confirm.',
+        CONFIRM_NO:  'You selected: no, keep waiting. Tap once more to confirm.'
+    },
+    CONFIRM_ARRIVAL: {
+        CONFIRM_YES: 'You selected: yes, I have crossed safely. Tap once more to confirm.'
+    }
+};
+
+function armPendingConfirmation(intent) {
+    pendingConfirmation = { intent, originState: currentState };
+    const echo = (CONFIRMATION_ECHO_MESSAGES[currentState] || {})[intent] ||
+        'Tap once more to confirm your selection.';
+    speak(echo);
+
+    if (pendingConfirmationTimerId) clearTimeout(pendingConfirmationTimerId);
+    pendingConfirmationTimerId = setTimeout(() => {
+        if (pendingConfirmation) {
+            pendingConfirmation = null;
+            speak('No confirmation received. Please make your selection again.');
+        }
+    }, PENDING_CONFIRMATION_TIMEOUT_MS);
+}
+
+function resolvePendingConfirmation(gesture) {
+    const confirmed = pendingConfirmation;
+    pendingConfirmation = null;
+    if (pendingConfirmationTimerId) {
+        clearTimeout(pendingConfirmationTimerId);
+        pendingConfirmationTimerId = null;
+    }
+
+    if (gesture !== 'single_tap') {
+        speak('Cancelled. Please make your selection again.');
+        return;
+    }
+
+    // Fail-safe: if the state changed while the confirmation was pending
+    // (e.g. glasses disconnected, or the light changed underneath the
+    // user), the original decision no longer applies -- discard it rather
+    // than executing a now-stale intent against a different situation.
+    if (currentState !== confirmed.originState) {
+        debugLog('State changed during pending confirmation -- discarding stale intent');
+        return;
+    }
+
+    debugLog('Confirmation acknowledged -> ' + confirmed.intent);
+    handleIntent(confirmed.intent);
+}
+
 function classifyGesture(count) {
     const gestureMap = { 1: 'single_tap', 2: 'double_tap', 3: 'triple_tap' };
     const gesture = gestureMap[Math.min(count, 3)];
     if (!gesture) return;
+
+    // If a confirmation is currently pending, THIS tap decides it --
+    // single tap confirms, anything else cancels. Normal gesture rules
+    // are bypassed entirely while a confirmation is pending.
+    if (pendingConfirmation) {
+        resolvePendingConfirmation(gesture);
+        return;
+    }
 
     const rules = GESTURE_RULES[currentState] || {};
     const intent = rules[gesture];
@@ -598,13 +806,16 @@ function classifyGesture(count) {
                 speak('Scanning in progress. Please wait.');
                 break;
             case STATES.NAVIGATING:
-                speak('Listen for the voice directions to reach the crossing.');
+                speak('Follow the haptic feedback on the glasses to reach the crossing.');
                 break;
             case STATES.WAITING:
                 speak('Please wait for the green man signal.');
                 break;
             case STATES.CROSSING:
                 speak('Cross now. Walk straight ahead.');
+                break;
+            case STATES.CONFIRM_ARRIVAL:
+                speak('If you feel the tactile ground indicators, tap once to confirm you have crossed safely.');
                 break;
             case STATES.READY:
                 speak('Tap anywhere once to start scanning for a crossing.');
@@ -620,6 +831,16 @@ function classifyGesture(count) {
     }
 
     debugLog('Gesture: ' + gesture + ' → ' + intent);
+
+    // CONFIRM_YES / CONFIRM_NO are the safety-critical decisions (choosing
+    // a crossing, confirming it's safe to cross, cycling to another
+    // crossing) -- require a follow-up tap before actually committing,
+    // instead of acting on the very first tap alone.
+    if (intent === 'CONFIRM_YES' || intent === 'CONFIRM_NO') {
+        armPendingConfirmation(intent);
+        return;
+    }
+
     handleIntent(intent);
 }
 
@@ -632,7 +853,7 @@ function handleIntent(intent) {
         case 'CONFIRM_YES':
             if (currentState === STATES.CONFIRM_TARGET) {
                 navigatingStartHeading = currentHeading;
-                transitionTo(STATES.NAVIGATING, 'Confirmed. I will guide you with voice directions.');
+                transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 crossingStartHeading = currentHeading;
                 crossingStartLocation = currentLocation;  // may be null if no GPS fix yet -- handled below
@@ -641,12 +862,16 @@ function handleIntent(intent) {
                 if (!crossingStartLocation) {
                     debugLog('No GPS fix at crossing start -- falling back to timer only');
                 }
-                // Safety net: completes the crossing after a fixed duration
-                // regardless of GPS, in case there's no fix, poor signal, or
-                // the user isn't moving in a way GPS can resolve indoors/in
-                // a small test space. If GPS distance completes it first,
-                // this gets cancelled inside completeCrossing().
-                crossingFallbackTimerId = setTimeout(completeCrossing, CROSSING_MAX_DURATION_MS);
+                // Safety net: prompts for arrival confirmation after a fixed
+                // duration regardless of GPS, in case there's no fix, poor
+                // signal, or the user isn't moving in a way GPS can resolve
+                // indoors/in a small test space. This does NOT auto-complete
+                // the crossing -- it still requires the user's tap, same as
+                // the GPS-triggered path. If GPS prompts first, this gets
+                // cancelled inside promptArrivalConfirmation().
+                crossingFallbackTimerId = setTimeout(promptArrivalConfirmation, CROSSING_MAX_DURATION_MS);
+            } else if (currentState === STATES.CONFIRM_ARRIVAL) {
+                completeCrossing();
             }
             break;
         case 'CONFIRM_NO':
@@ -673,11 +898,12 @@ const UI_CONFIG = {
     RESOLVING:        { icon: '📍', label: 'Locating...', cls: 'state-confirm', hint: '', msg: 'Finding nearby crossings.' },
     TARGET_DETECTED:  { icon: '🚦', label: 'Found!', cls: 'state-success', hint: '', msg: 'Traffic light found.' },
     CONFIRM_TARGET:   { icon: '?', label: 'Confirm', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = No', msg: 'Is this the right crossing?' },
-    NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Listen for voice directions.' },
+    NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Follow haptic feedback.' },
     REACHED:          { icon: '✓', label: 'Arrived', cls: 'state-success', hint: '', msg: 'You have arrived.' },
     WAITING:          { icon: '🔴', label: 'Red man', cls: 'state-danger', hint: '', msg: 'Please wait.' },
     CONFIRM_CROSSING: { icon: '🟢', label: 'Cross now?', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = Wait', msg: 'Green man. Ready to cross?' },
     CROSSING:         { icon: '🚶', label: 'Crossing', cls: 'state-success', hint: '', msg: 'Cross now.' },
+    CONFIRM_ARRIVAL:  { icon: '?', label: 'Confirm arrival', cls: 'state-confirm', hint: '1 tap = confirm', msg: 'Feel the tactile indicators? Tap to confirm.' },
     COMPLETED:        { icon: '✓', label: 'Tap to reset', cls: 'state-success', hint: '1 tap to scan again', msg: 'Crossing complete.' },
     LOST_CONNECTION:  { icon: '✕', label: 'Disconnected', cls: '', hint: '', msg: 'Glasses disconnected.' }
 };
@@ -726,11 +952,12 @@ const STATE_SPEECH = {
     RESOLVING:        'Identifying nearby crossings. Please wait.',
     TARGET_DETECTED:  'Traffic light found.',
     CONFIRM_TARGET:   'Is this the right crossing? Double tap for yes, triple tap to try again.',
-    NAVIGATING:       'Confirmed. I will guide you with voice directions.',
+    NAVIGATING:       'Confirmed. Follow the haptic feedback toward the crossing.',
     REACHED:          'You have reached the crossing.',
     WAITING:          'Checking the signal…',
     CONFIRM_CROSSING: 'Green man. You may cross. Double tap to confirm.',
     CROSSING:         'Cross now. Walk straight ahead.',
+    CONFIRM_ARRIVAL:  'If you feel the tactile ground indicators, tap once to confirm you have crossed safely.',
     COMPLETED:        'Crossing complete. Well done. Tap once to scan again.',
     LOST_CONNECTION:  'Glasses disconnected. Please check the connection.'
 };
