@@ -483,9 +483,10 @@ function handleGuidance(dets) {
     const frameW = overlay.width || 1;
 
     // Announce spotting the traffic-light post(s). Only meaningful while
-    // SCANNING — app.js's onTrafficLightVisible guards on that state too,
-    // so this is safe to call on every frame without extra cooldown logic;
-    // once it transitions away from SCANNING, this block stops firing.
+    // SCANNING — app.js's callbacks guard on that state too, so this is
+    // safe to call on every frame without extra cooldown logic; once it
+    // transitions away from SCANNING, this block stops firing (state check
+    // below naturally prevents re-triggering the choice prompt every frame).
     const posts = dets.filter(d => CLASSES[d.cls] === 'traffic-light');
     if (posts.length &&
         window.navassist.currentState &&
@@ -497,6 +498,21 @@ function handleGuidance(dets) {
             const dirs = posts
                 .map(p => getDirection(((p.x1 + p.x2) / 2) / frameW))
                 .filter((v, i, arr) => arr.indexOf(v) === i); // unique, order-preserving
+
+            if (dirs.length === 2 && dirs.includes('LEFT') && dirs.includes('RIGHT')) {
+                // Clean two-way split (one clearly left, one clearly right) --
+                // let the user actually choose which one to head toward,
+                // rather than silently auto-picking the higher-confidence one.
+                window.navassist.onMultiplePostsChoice && window.navassist.onMultiplePostsChoice();
+                return;
+            }
+
+            // Anything messier than a clean left/right split (3+ directions,
+            // or multiple boxes clustered in the same direction bucket) --
+            // fall back to the existing behaviour: announce it, then
+            // auto-proceed with whichever detection scored highest. Trying
+            // to build a 3+-way choice gesture isn't worth the complexity
+            // for what should be a rare edge case.
             const desc = dirs.length > 1
                 ? `Multiple traffic light posts detected: ${dirs.join(' and ').toLowerCase()}.`
                 : `Traffic light posts detected to your ${dirs[0].toLowerCase()}.`;
