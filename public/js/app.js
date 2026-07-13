@@ -35,6 +35,7 @@ const STATES = {
     IDLE:             'IDLE',
     READY:            'READY',
     SCANNING:         'SCANNING',
+    CHOOSE_POST:      'CHOOSE_POST',
     RESOLVING:        'RESOLVING',
     TARGET_DETECTED:  'TARGET_DETECTED',
     CONFIRM_TARGET:   'CONFIRM_TARGET',
@@ -61,6 +62,7 @@ function transitionTo(newState, message) {
 const GESTURE_RULES = {
     [STATES.READY]:            { single_tap: 'START_SCAN' },
     [STATES.CONFIRM_TARGET]:   { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
+    [STATES.CHOOSE_POST]:      { double_tap: 'CHOOSE_LEFT', triple_tap: 'CHOOSE_RIGHT' },
     [STATES.CONFIRM_CROSSING]: { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
     [STATES.CONFIRM_ARRIVAL]:  { single_tap: 'CONFIRM_YES' },
     [STATES.COMPLETED]:        { single_tap: 'RESET' }
@@ -144,6 +146,14 @@ function handleConnectionEvent(payload) {
                 clearTimeout(pendingConfirmationTimerId);
                 pendingConfirmationTimerId = null;
             }
+        }
+        if (crossingStallCheckId) {
+            clearInterval(crossingStallCheckId);
+            crossingStallCheckId = null;
+        }
+        if (crossingFallbackTimerId) {
+            clearTimeout(crossingFallbackTimerId);
+            crossingFallbackTimerId = null;
         }
         if (currentState !== STATES.IDLE) {
             speak('Glasses disconnected. Please check the connection.', true);
@@ -276,13 +286,26 @@ window.navassist.isImuCalibrated = () => imuCalibrated;
 
 let currentLocation = null;
 
-// Crossing completion: track distance moved since CROSSING began, instead of
-// blindly assuming 15 seconds means "made it across". Falls back to a timer
-// only if GPS never gets a usable fix.
+// Crossing completion: PRIMARY trigger is real GPS distance moved (unchanged
+// -- still fires the moment someone has genuinely covered a crossing's
+// worth of distance). The FALLBACK, though, no longer assumes a fixed
+// duration means "done" -- a fixed number can't be right for both a narrow
+// 3-lane crossing and a wide multi-lane road with a median. Instead it
+// tracks whether GPS distance is STILL INCREASING (still walking, however
+// long the crossing is) versus STALLED (hasn't meaningfully progressed in
+// a while -- either arrived and stopped, or something's wrong either way).
+// A stall is what triggers the check-in prompt, not elapsed time.
 let crossingStartLocation = null;
 let crossingFallbackTimerId = null;
-const CROSSING_DISTANCE_THRESHOLD_M = 8;    // typical minimum pedestrian crossing width
-const CROSSING_MAX_DURATION_MS = 25000;     // safety net if GPS has no fix / poor signal
+let crossingStallCheckId = null;
+let lastCrossingDistance = 0;
+let lastCrossingProgressAt = 0;
+let crossingStallWarned = false;
+const CROSSING_DISTANCE_THRESHOLD_M = 8;      // typical minimum pedestrian crossing width
+const CROSSING_PROGRESS_MIN_DELTA_M = 1;      // ignore GPS jitter smaller than this as "not real progress"
+const CROSSING_STALL_WARNING_MS = 8000;       // gentle heads-up before the actual prompt
+const CROSSING_STALL_PROMPT_MS = 12000;       // no forward progress for this long -> prompt
+const CROSSING_ABSOLUTE_CEILING_MS = 90000;   // last-resort only, e.g. total GPS loss with zero updates at all
 
 // Haversine formula: great-circle distance between two lat/lng points in meters
 function distanceMeters(lat1, lng1, lat2, lng2) {
@@ -295,18 +318,38 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Fired once the user has moved far enough (GPS) or the fallback timer
-// elapses -- either way, this does NOT complete the crossing automatically
-// anymore. It prompts the user to check for tactile ground indicators with
-// their cane and explicitly confirm before the crossing is marked complete.
-// This exists specifically to prevent a false "crossing complete" while the
-// user might still be halfway across -- GPS alone isn't trusted to make
-// that call on its own.
+// Runs on a fixed interval while CROSSING (independent of how often GPS
+// updates actually arrive, since those can be sparse/irregular). Checks how
+// long it's been since distance last meaningfully increased.
+function checkCrossingStall() {
+    if (currentState !== STATES.CROSSING) return;
+    const stalledFor = Date.now() - lastCrossingProgressAt;
+
+    if (stalledFor >= CROSSING_STALL_PROMPT_MS) {
+        crossingStallWarned = false;  // reset for next time, if this prompt gets cancelled/ignored
+        promptArrivalConfirmation();
+    } else if (stalledFor >= CROSSING_STALL_WARNING_MS && !crossingStallWarned) {
+        crossingStallWarned = true;
+        speak('Still walking? Let me know once you have crossed.');
+    }
+}
+
+// Fired once the user has moved far enough (GPS distance) or progress has
+// stalled for a while -- either way, this does NOT complete the crossing
+// automatically anymore. It prompts the user to check for tactile ground
+// indicators with their cane and explicitly confirm before the crossing is
+// marked complete. This exists specifically to prevent a false "crossing
+// complete" while the user might still be halfway across -- GPS alone isn't
+// trusted to make that call on its own.
 function promptArrivalConfirmation() {
     if (currentState !== STATES.CROSSING) return;  // already prompted or moved on -- avoid double-firing
     if (crossingFallbackTimerId) {
         clearTimeout(crossingFallbackTimerId);
         crossingFallbackTimerId = null;
+    }
+    if (crossingStallCheckId) {
+        clearInterval(crossingStallCheckId);
+        crossingStallCheckId = null;
     }
     transitionTo(STATES.CONFIRM_ARRIVAL,
         'You may have reached the other side. If you can feel the tactile ground indicators with your cane, tap once to confirm you have crossed safely.');
@@ -353,6 +396,13 @@ function startGpsTracking() {
                     currentLocation.latitude, currentLocation.longitude
                 );
                 debugLog('Crossing distance moved: ' + moved.toFixed(1) + 'm');
+
+                if (moved - lastCrossingDistance >= CROSSING_PROGRESS_MIN_DELTA_M) {
+                    lastCrossingDistance = moved;
+                    lastCrossingProgressAt = Date.now();
+                    crossingStallWarned = false;  // fresh progress -- reset the warning so it can fire again if they stall later
+                }
+
                 if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
                     promptArrivalConfirmation();
                 }
@@ -574,6 +624,19 @@ window.navassist.onTrafficLightVisible = function(confidence) {
     }
 };
 
+// Called by ai.js when exactly two traffic-light posts are visible at once,
+// clearly separated left/right -- instead of silently picking whichever one
+// scored higher confidence, the user actually gets to choose which one to
+// head toward. Goes through the same double-confirmation gate as every
+// other decision in the app (CHOOSE_LEFT/CHOOSE_RIGHT are wrapped by the
+// pending-confirmation layer above, same as CONFIRM_YES/CONFIRM_NO).
+window.navassist.onMultiplePostsChoice = function() {
+    if (currentState !== STATES.SCANNING) return;
+    transitionTo(STATES.CHOOSE_POST,
+        'Two traffic light posts detected: one on your left, one on your right. ' +
+        'Double tap to choose the left post, triple tap to choose the right post.');
+};
+
 // Haptic-only direction guidance while walking toward the traffic light post.
 // (Reverted back from audio -- team decided haptic during NAVIGATING after all.)
 window.navassist.onDirectionDecided = function(direction) {
@@ -733,6 +796,10 @@ const CONFIRMATION_ECHO_MESSAGES = {
     },
     CONFIRM_ARRIVAL: {
         CONFIRM_YES: 'You selected: yes, I have crossed safely. Tap once more to confirm.'
+    },
+    CHOOSE_POST: {
+        CHOOSE_LEFT:  'You selected: the post on your left. Tap once more to confirm.',
+        CHOOSE_RIGHT: 'You selected: the post on your right. Tap once more to confirm.'
     }
 };
 
@@ -824,6 +891,9 @@ function classifyGesture(count) {
             case STATES.CONFIRM_CROSSING:
                 speak('Double tap anywhere to confirm yes, or triple tap to try again.');
                 break;
+            case STATES.CHOOSE_POST:
+                speak('Double tap for the post on your left, or triple tap for the post on your right.');
+                break;
             default:
                 announceState(currentState);
         }
@@ -836,7 +906,8 @@ function classifyGesture(count) {
     // a crossing, confirming it's safe to cross, cycling to another
     // crossing) -- require a follow-up tap before actually committing,
     // instead of acting on the very first tap alone.
-    if (intent === 'CONFIRM_YES' || intent === 'CONFIRM_NO') {
+    if (intent === 'CONFIRM_YES' || intent === 'CONFIRM_NO' ||
+        intent === 'CHOOSE_LEFT' || intent === 'CHOOSE_RIGHT') {
         armPendingConfirmation(intent);
         return;
     }
@@ -859,17 +930,28 @@ function handleIntent(intent) {
                 crossingStartLocation = currentLocation;  // may be null if no GPS fix yet -- handled below
                 transitionTo(STATES.CROSSING, 'Cross now. Walk straight ahead.');
 
+                lastCrossingDistance = 0;
+                lastCrossingProgressAt = Date.now();
+                crossingStallWarned = false;
+
                 if (!crossingStartLocation) {
-                    debugLog('No GPS fix at crossing start -- falling back to timer only');
+                    debugLog('No GPS fix at crossing start -- stall detection will not have distance data, only the absolute ceiling applies');
                 }
-                // Safety net: prompts for arrival confirmation after a fixed
-                // duration regardless of GPS, in case there's no fix, poor
-                // signal, or the user isn't moving in a way GPS can resolve
-                // indoors/in a small test space. This does NOT auto-complete
-                // the crossing -- it still requires the user's tap, same as
-                // the GPS-triggered path. If GPS prompts first, this gets
-                // cancelled inside promptArrivalConfirmation().
-                crossingFallbackTimerId = setTimeout(promptArrivalConfirmation, CROSSING_MAX_DURATION_MS);
+                // Progress-stall detection: checks every few seconds whether
+                // GPS distance is still increasing (still walking, however
+                // long the crossing is) versus stalled (arrived and stopped,
+                // or something's wrong) -- see checkCrossingStall(). This
+                // replaces a fixed-duration assumption, which can't be
+                // correct for both a narrow crossing and a wide one with a
+                // median.
+                crossingStallCheckId = setInterval(checkCrossingStall, 2000);
+
+                // Absolute last-resort ceiling: only matters if there's
+                // truly zero GPS data at all (no fix ever, e.g. testing
+                // indoors) so the app can never get stuck waiting forever.
+                // Deliberately generous -- this should almost never be what
+                // actually fires if GPS is working.
+                crossingFallbackTimerId = setTimeout(promptArrivalConfirmation, CROSSING_ABSOLUTE_CEILING_MS);
             } else if (currentState === STATES.CONFIRM_ARRIVAL) {
                 completeCrossing();
             }
@@ -879,6 +961,20 @@ function handleIntent(intent) {
                 tryNextCrossing();
             } else if (currentState === STATES.CONFIRM_CROSSING) {
                 transitionTo(STATES.WAITING, 'Understood. Continuing to wait for green man.');
+            }
+            break;
+        case 'CHOOSE_LEFT':
+        case 'CHOOSE_RIGHT':
+            if (currentState === STATES.CHOOSE_POST) {
+                const chosenSide = intent === 'CHOOSE_LEFT' ? 'left' : 'right';
+                const message = `Heading toward the post on your ${chosenSide}. ` +
+                    'Double tap to confirm this is your crossing, triple tap to keep scanning.';
+                transitionTo(STATES.TARGET_DETECTED);
+                setTimeout(() => {
+                    if (currentState === STATES.TARGET_DETECTED) {
+                        transitionTo(STATES.CONFIRM_TARGET, message);
+                    }
+                }, 1500);
             }
             break;
         case 'RESET':
@@ -898,6 +994,7 @@ const UI_CONFIG = {
     RESOLVING:        { icon: '📍', label: 'Locating...', cls: 'state-confirm', hint: '', msg: 'Finding nearby crossings.' },
     TARGET_DETECTED:  { icon: '🚦', label: 'Found!', cls: 'state-success', hint: '', msg: 'Traffic light found.' },
     CONFIRM_TARGET:   { icon: '?', label: 'Confirm', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = No', msg: 'Is this the right crossing?' },
+    CHOOSE_POST:      { icon: '↔', label: 'Choose post', cls: 'state-confirm', hint: '2 taps = Left  •  3 taps = Right', msg: 'Which traffic light post?' },
     NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Follow haptic feedback.' },
     REACHED:          { icon: '✓', label: 'Arrived', cls: 'state-success', hint: '', msg: 'You have arrived.' },
     WAITING:          { icon: '🔴', label: 'Red man', cls: 'state-danger', hint: '', msg: 'Please wait.' },
@@ -952,6 +1049,7 @@ const STATE_SPEECH = {
     RESOLVING:        'Identifying nearby crossings. Please wait.',
     TARGET_DETECTED:  'Traffic light found.',
     CONFIRM_TARGET:   'Is this the right crossing? Double tap for yes, triple tap to try again.',
+    CHOOSE_POST:      'Two traffic light posts detected. Double tap for the left post, triple tap for the right post.',
     NAVIGATING:       'Confirmed. Follow the haptic feedback toward the crossing.',
     REACHED:          'You have reached the crossing.',
     WAITING:          'Checking the signal…',
