@@ -66,11 +66,11 @@ let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop g
 let pendingB64 = null;        // newest frame that arrived while a decode was in flight
 
 // The camera is mounted sideways, so every incoming frame is rotated 90°
-// ANTICLOCKWISE at the one point it enters (decodeFrame). The rotated frame
-// then feeds the display, the browser worker, AND the server /api/infer model,
-// so the feed and the AI always agree on orientation. Set false if the camera
-// is ever remounted upright.
-const ROTATE_FRAME_CCW90 = true;
+// CLOCKWISE at the one point it enters (decodeFrame). The rotated frame then
+// feeds the display, the browser worker, AND the server /api/infer model, so
+// the feed and the AI always agree on orientation. Set false if the camera is
+// ever remounted upright.
+const ROTATE_FRAME_CW90 = true;
 
 // Server-side crossing perception (/api/infer -- dotted-line corridor +
 // light-state reading via segmentation model). Runs independently of, and
@@ -225,12 +225,12 @@ function decodeFrame(b64) {
     decodeInFlight = true;
     const img = new Image();
     img.onload = () => {
-        // Rotate 90° anticlockwise here, at the single entry point, so the
-        // display AND both models (browser worker + server /api/infer) all see
-        // the same upright frame. When rotated, width/height swap. frameCanvas
-        // holds the rotated frame and doubles as the inference source and the
-        // /api/infer payload.
-        const rot = ROTATE_FRAME_CCW90;
+        // Rotate 90° clockwise here, at the single entry point, so the display
+        // AND both models (browser worker + server /api/infer) all see the same
+        // upright frame. When rotated, width/height swap. frameCanvas holds the
+        // rotated frame and doubles as the inference source and the /api/infer
+        // payload.
+        const rot = ROTATE_FRAME_CW90;
         const cw = rot ? img.height : img.width;    // display/canvas width
         const ch = rot ? img.width  : img.height;   // display/canvas height
         if (frameCanvas.width !== cw || frameCanvas.height !== ch) {
@@ -241,8 +241,8 @@ function decodeFrame(b64) {
         }
         frameCtx.save();
         if (rot) {
-            frameCtx.translate(0, ch);              // 90° CCW: move origin to bottom-left
-            frameCtx.rotate(-Math.PI / 2);
+            frameCtx.translate(cw, 0);              // 90° CW: move origin to top-right
+            frameCtx.rotate(Math.PI / 2);
         }
         frameCtx.drawImage(img, 0, 0);
         frameCtx.restore();
