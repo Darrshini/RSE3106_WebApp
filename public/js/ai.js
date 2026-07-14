@@ -61,9 +61,16 @@ let inferBusy = false;        // true while the worker is mid-inference (one at 
 let frameCanvas, overlay, frameCtx, octx;
 let preCanvas, preCtx;        // offscreen canvas for letterbox pre-processing
 let latestDetections = [];
-let latestFrameImg = null;    // most recent decoded camera frame (Image element)
+let latestFrameImg = null;    // inference source: the frameCanvas AFTER rotation
 let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop guard)
 let pendingB64 = null;        // newest frame that arrived while a decode was in flight
+
+// The camera is mounted sideways, so every incoming frame is rotated 90°
+// ANTICLOCKWISE at the one point it enters (decodeFrame). The rotated frame
+// then feeds the display, the browser worker, AND the server /api/infer model,
+// so the feed and the AI always agree on orientation. Set false if the camera
+// is ever remounted upright.
+const ROTATE_FRAME_CCW90 = true;
 
 // Server-side crossing perception (/api/infer -- dotted-line corridor +
 // light-state reading via segmentation model). Runs independently of, and
@@ -71,7 +78,6 @@ let pendingB64 = null;        // newest frame that arrived while a decode was in
 // ADDS dotted-line corridor guidance and a more accurate flashing-light
 // read; it does not replace the existing traffic-light-post detection used
 // during SCANNING.
-let latestFrameB64 = null;
 let crossingInferInFlight = false;
 let lastCrossingInferAt = 0;
 let noDashStreak = 0;
@@ -200,9 +206,6 @@ function handleCameraFrame(payload) {
     const b64 = typeof payload === 'string' ? payload : (payload.image || payload.data || payload.frame);
     if (!b64) return;
 
-    latestFrameB64 = b64;
-    maybeRunCrossingInfer();
-
     // Frame-drop guard: only ever decode ONE frame at a time. If a decode is
     // already running, stash just the newest frame and drop everything that
     // arrived in between -- we only care about the latest. Without this, a
@@ -222,16 +225,31 @@ function decodeFrame(b64) {
     decodeInFlight = true;
     const img = new Image();
     img.onload = () => {
-        if (frameCanvas.width !== img.width || frameCanvas.height !== img.height) {
-            frameCanvas.width = overlay.width = img.width;
-            frameCanvas.height = overlay.height = img.height;
+        // Rotate 90° anticlockwise here, at the single entry point, so the
+        // display AND both models (browser worker + server /api/infer) all see
+        // the same upright frame. When rotated, width/height swap. frameCanvas
+        // holds the rotated frame and doubles as the inference source and the
+        // /api/infer payload.
+        const rot = ROTATE_FRAME_CCW90;
+        const cw = rot ? img.height : img.width;    // display/canvas width
+        const ch = rot ? img.width  : img.height;   // display/canvas height
+        if (frameCanvas.width !== cw || frameCanvas.height !== ch) {
+            frameCanvas.width = overlay.width = cw;
+            frameCanvas.height = overlay.height = ch;
             const cv = overlay.parentElement;
-            if (cv && img.width) cv.style.aspectRatio = img.width + ' / ' + img.height;
+            if (cv && cw) cv.style.aspectRatio = cw + ' / ' + ch;
+        }
+        frameCtx.save();
+        if (rot) {
+            frameCtx.translate(0, ch);              // 90° CCW: move origin to bottom-left
+            frameCtx.rotate(-Math.PI / 2);
         }
         frameCtx.drawImage(img, 0, 0);
-        latestFrameImg = img;
+        frameCtx.restore();
+        latestFrameImg = frameCanvas;               // rotated frame is the inference source
         if (modelStatus === 'waiting-esp32') modelStatus = 'ready';
-        maybeRunInference();
+        maybeRunInference();                        // browser worker (pedestrian.onnx)
+        maybeRunCrossingInfer();                    // server seg model (/api/infer)
         onDecodeSettled();
     };
     img.onerror = () => {
@@ -257,17 +275,21 @@ function onDecodeSettled() {
 // Server-side crossing perception (dotted-line corridor + light state)
 // ============================================================
 async function maybeRunCrossingInfer() {
-    if (crossingInferInFlight || !latestFrameB64) return;
+    if (crossingInferInFlight || !latestFrameImg) return;
     const now = performance.now();
     if (now - lastCrossingInferAt < CROSSING_INFER_INTERVAL_MS) return;
     lastCrossingInferAt = now;
     crossingInferInFlight = true;
 
     try {
+        // Send the ROTATED frame (what's on frameCanvas) so the server model
+        // sees the same orientation as the display and the browser worker.
+        // Re-encode at modest quality to keep this frequent POST small.
+        const dataUrl = frameCanvas.toDataURL('image/jpeg', 0.7);
         const res = await fetch('/api/infer', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: 'data:image/jpeg;base64,' + latestFrameB64 })
+            body: JSON.stringify({ image: dataUrl })
         });
         if (res.ok) {
             const result = await res.json();
