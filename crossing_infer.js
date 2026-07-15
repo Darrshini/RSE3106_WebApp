@@ -43,11 +43,25 @@ function letterbox(w, h) {
     return { scale, nw, nh, padX: Math.floor((INPUT - nw) / 2), padY: Math.floor((INPUT - nh) / 2) };
 }
 
-async function preprocess(buf) {
-    const meta = await sharp(buf).metadata();
-    const w = meta.width, h = meta.height;
+// `rotate` is degrees CLOCKWISE, applied before anything else. The Pi's Camera
+// Module is mounted sideways, so its frames arrive 90 deg CCW of upright and the
+// server un-rotates them here, at the single point where it decodes the JPEG --
+// so this costs nothing extra. Everything downstream (letterbox, w/h, origRaw,
+// and therefore every box/mask/angle we return) is then in UPRIGHT coordinates,
+// which is the same space the browser draws in after rotating the frame on its
+// canvas. A webcam or an uploaded video is already upright, so those callers
+// pass rotate=0 and this whole path is a no-op for them.
+async function preprocess(buf, rotate) {
+    const src = () => (rotate ? sharp(buf).rotate(rotate) : sharp(buf));
+
+    // Take w/h from the ROTATED raw buffer, not from metadata() -- metadata()
+    // reports the JPEG's on-disk dimensions, which are still the un-rotated ones.
+    const { data: origRaw, info } =
+        await src().removeAlpha().raw().toBuffer({ resolveWithObject: true });  // also the HSV colour read
+    const w = info.width, h = info.height;
+
     const { scale, nw, nh, padX, padY } = letterbox(w, h);
-    const lb = await sharp(buf).removeAlpha()
+    const lb = await src().removeAlpha()
         .resize(nw, nh, { fit: 'fill' })
         .extend({ top: padY, bottom: INPUT - nh - padY, left: padX, right: INPUT - nw - padX,
                   background: { r: 114, g: 114, b: 114 } })
@@ -56,7 +70,6 @@ async function preprocess(buf) {
     for (let i = 0; i < area; i++) {
         data[i] = lb[i*3] / 255; data[i+area] = lb[i*3+1] / 255; data[i+2*area] = lb[i*3+2] / 255;
     }
-    const origRaw = await sharp(buf).removeAlpha().raw().toBuffer();   // for the HSV colour read
     return { tensor: new ort.Tensor('float32', data, [1,3,INPUT,INPUT]), scale, padX, padY, w, h, origRaw };
 }
 
@@ -200,9 +213,10 @@ function corridor(lines, light, w, h) {
     return { has:true, near:user, far, angleDeg: Math.atan2(hy,hx)*180/Math.PI, lightAgrees };
 }
 
-async function infer(buf) {
+async function infer(buf, opts) {
+    const rotate = (opts && opts.rotate) || 0;
     const s = await load();
-    const pre = await preprocess(buf);
+    const pre = await preprocess(buf, rotate);
     const out = await s.run({ [s.inputNames[0]]: pre.tensor });
     const proto = out[s.outputNames[1]].data;                 // output1: 32 mask prototypes @160x160
     const dets = decode(out[s.outputNames[0]], pre.scale, pre.padX, pre.padY, pre.w, pre.h);

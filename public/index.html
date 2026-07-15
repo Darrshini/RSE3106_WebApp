@@ -45,6 +45,13 @@
                  here -- there's no MediaStream, frames arrive over WebSocket. -->
             <div class="camera-view">
                 <canvas id="camFrame"></canvas>
+                <!-- crossing_seg.onnx output, run on the SERVER against the frame
+                     the Pi already sent it and pushed here over /live: dotted-line
+                     masks, corridor arrow, pedestrian-light box. Drawn here so the
+                     real app visibly runs BOTH models, exactly like pi.html. This
+                     is a view only -- app.js still owns every decision and every
+                     spoken cue; ai.js only renders onto this layer. -->
+                <canvas id="crossOverlay"></canvas>
                 <canvas id="camOverlay"></canvas>
             </div>
 

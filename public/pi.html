@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NavAssist — Raspberry Pi camera (both models)</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { overflow: auto; }
+        .wrap { max-width: 900px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+        .topbar h1 { font-size: 20px; }
+        .topbar a { color: var(--accent-blue); text-decoration: none; font-size: 14px; }
+        /* Portrait by default: the camera is mounted sideways, so once the frame
+           is rotated upright it is TALLER than it is wide. pi.js overwrites this
+           with the true ratio as soon as the first frame lands. */
+        .camera-view { position: relative; width: 100%; max-width: 480px; margin: 0 auto;
+                       aspect-ratio: 3/4; background: #000;
+                       border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+        .camera-view canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+        #crossOverlay, #detOverlay { pointer-events: none; }
+        .controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        label { font-size: 14px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+        .statusline { font-size: 15px; color: var(--text-secondary); }
+        .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #ff1744; margin-right: 6px; }
+        .dot.on { background: #00c853; }
+        .legend { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+        .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; vertical-align: middle; }
+        code { background: rgba(255,255,255,.07); padding: 1px 5px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="topbar">
+            <h1>🚦 Raspberry Pi camera — both models</h1>
+            <a href="webcam.html">↦ Laptop webcam version</a>
+        </div>
+
+        <div class="camera-view">
+            <!-- camFrame holds each JPEG from the Pi, already rotated upright.
+                 No <video>: frames arrive as discrete JPEGs over a WebSocket,
+                 not as a media stream. -->
+            <canvas id="camFrame"></canvas>
+            <!-- crossing_seg.onnx, run on the SERVER against the frame it already
+                 has, pushed here over the same socket: dotted-line masks, corridor
+                 arrow, light-state banner. -->
+            <canvas id="crossOverlay"></canvas>
+            <!-- pedestrian.onnx, run in THIS browser's worker: boxes, green arrow, HUD. -->
+            <canvas id="detOverlay"></canvas>
+        </div>
+
+        <div class="statusline"><span class="dot" id="piDot"></span><span id="piState">Waiting for the Pi to connect…</span></div>
+
+        <div class="controls">
+            <label><input type="checkbox" id="crossChk" checked> Crossing model (server)</label>
+            <label><input type="checkbox" id="pedChk" checked> Pedestrian model (browser)</label>
+            <label><input type="checkbox" id="muteChk"> Mute speech</label>
+            <label><input type="checkbox" id="hudChk" checked> HUD</label>
+            <label>Confidence
+                <input type="range" id="confRange" min="5" max="90" value="35">
+                <span id="confVal">0.35</span>
+            </label>
+        </div>
+
+        <!-- Manual haptic test. pi.html has no state machine, so it never sends
+             haptic/command on its own the way app.js does -- these buttons are the
+             only way to exercise browser -> server -> Pi -> motor from this page. -->
+        <div class="controls">
+            <span>Haptic test:</span>
+            <button type="button" id="hapLeft">Left (GPIO 13)</button>
+            <button type="button" id="hapRight">Right (GPIO 12)</button>
+            <button type="button" id="hapBoth">Both</button>
+        </div>
+
+        <div class="statusline" id="status">Loading pedestrian.onnx…</div>
+        <div class="statusline" id="crossState"></div>
+        <div class="statusline" id="hapticState"></div>
+
+        <div class="legend">
+            <b>pedestrian.onnx</b> — in this browser, on WebGPU (falls back to WASM):
+            <span class="sw" style="background:#ff1744"></span> red ·
+            <span class="sw" style="background:#00c853"></span> green ·
+            <span class="sw" style="background:#2979ff"></span> traffic-light post.
+            <br>
+            <b>crossing_seg.onnx</b> — on the Node server, on a worker thread, against the
+            frame the Pi already sent it: cyan dotted-line masks, corridor arrow, light-state banner.
+            <br>
+            The Pi is a <b>camera only</b> — a Zero 2W cannot run either model at a usable rate.
+            The server un-rotates its sideways frames (<code>PI_ROTATE</code>, default 90° CW)
+            so both models and this display agree on which way is up.
+            <br>
+            HUD reads: <code>link fps · frame size · pedestrian ms · crossing ms · det count</code>.
+            If you see no boxes, drop the confidence slider before assuming the model is broken.
+        </div>
+    </div>
+
+    <!-- crossing.js exposes window.Crossing (FSM + overlay); pi.js owns the socket,
+         the frame decode, and pedestrian.onnx. -->
+    <script src="js/crossing.js"></script>
+    <script src="js/pi.js"></script>
+</body>
+</html>

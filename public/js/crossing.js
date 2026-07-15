@@ -58,16 +58,41 @@
     }
     function status(msg) { if (onStatus) onStatus(state, msg); }
 
-    function start(videoEl, overlayEl, statusCb) {
-        video = videoEl; overlay = overlayEl; onStatus = statusCb;
+    function reset(overlayEl, statusCb) {
+        overlay = overlayEl; onStatus = statusCb;
         octx = overlay.getContext('2d');
         cap = document.createElement('canvas'); capctx = cap.getContext('2d', { willReadFrequently: true });
         maskCanvas = document.createElement('canvas'); maskCtx = maskCanvas.getContext('2d');
-        state = S.WAITING; noDash = 0; running = true;
+        state = S.WAITING; noDash = 0; running = true; latest = null;
         redSince = null; hurried = false; lastCat = 'NONE'; lastDirWord = ''; lastSpeakAt = 0;
         requestAnimationFrame(draw);
+    }
+
+    // SELF-DRIVEN (webcam / uploaded video): pull frames off a <video> and POST
+    // them to /api/infer ourselves.
+    function start(videoEl, overlayEl, statusCb) {
+        video = videoEl;
+        reset(overlayEl, statusCb);
         loop();
     }
+
+    // EXTERNALLY-DRIVEN (Raspberry Pi feed): the server already holds these
+    // frames -- the Pi sends them to it -- so it runs the model itself and pushes
+    // results down the WebSocket. Having the browser re-encode a frame and upload
+    // it back just to be told what's in it would be a wasted round trip. So
+    // there's nothing to capture or POST here: same FSM, same overlay, `r` simply
+    // arrives instead of being fetched. No loop().
+    function startExternal(overlayEl, statusCb) {
+        video = null;
+        reset(overlayEl, statusCb);
+    }
+
+    function push(r) {
+        if (!running || !r || !r.w) return;
+        latest = r;
+        decide(r, performance.now());
+    }
+
     function stop() { running = false; }
 
     // ---- inference loop (throttled, one request at a time) ----
@@ -249,5 +274,5 @@
         ctx.fill(); ctx.fillStyle = color; ctx.fillText(text, bx + pad, by + bh - fp * 0.75);
     }
 
-    window.Crossing = { start, stop };
+    window.Crossing = { start, startExternal, push, stop };
 })();

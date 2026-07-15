@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NavAssist — Webcam (both models)</title>
+    <link rel="stylesheet" href="css/style.css">
+    <style>
+        body { overflow: auto; }
+        .wrap { max-width: 900px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+        .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+        .topbar h1 { font-size: 20px; }
+        .topbar a { color: var(--accent-blue); text-decoration: none; font-size: 14px; }
+        .camera-view { position: relative; width: 100%; aspect-ratio: 16/9; background: #000;
+                       border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+        .camera-view video, .camera-view canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+        .camera-view video { object-fit: cover; }
+        .camera-view canvas { pointer-events: none; }
+        .controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+        .btn { padding: 12px 22px; border-radius: 10px; border: 2px solid var(--accent-blue);
+               background: var(--accent-blue); color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
+        .btn:disabled { opacity: .6; cursor: default; }
+        label { font-size: 14px; color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+        .statusline { font-size: 15px; color: var(--text-secondary); }
+        .legend { font-size: 13px; color: var(--text-secondary); line-height: 1.6; }
+        .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; vertical-align: middle; }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="topbar">
+            <h1>🚦 Webcam — pedestrian.onnx + crossing_seg.onnx</h1>
+            <a href="live.html">↦ Crossing model only</a>
+        </div>
+
+        <div class="camera-view">
+            <video id="feed" playsinline muted autoplay></video>
+            <!-- crossing_seg (server /api/infer): dotted-line masks, corridor arrow, banner -->
+            <canvas id="crossOverlay"></canvas>
+            <!-- pedestrian.onnx (in-browser worker): boxes, green arrow, HUD -->
+            <canvas id="detOverlay"></canvas>
+        </div>
+
+        <div class="controls">
+            <button id="startBtn" class="btn">Start camera</button>
+            <label><input type="checkbox" id="crossChk" checked> Crossing model (server)</label>
+            <label><input type="checkbox" id="muteChk"> Mute speech</label>
+            <label><input type="checkbox" id="hudChk" checked> HUD</label>
+            <label>Confidence
+                <input type="range" id="confRange" min="5" max="90" value="35">
+                <span id="confVal">0.35</span>
+            </label>
+        </div>
+
+        <div class="statusline" id="status">Click “Start camera”, allow access, then point at a pedestrian light.</div>
+        <div class="statusline" id="crossState"></div>
+
+        <div class="legend">
+            <b>pedestrian.onnx</b> — runs in your browser on WebGPU (falls back to WASM), boxes only:
+            <span class="sw" style="background:#ff1744"></span> red ·
+            <span class="sw" style="background:#00c853"></span> green ·
+            <span class="sw" style="background:#2979ff"></span> traffic-light post.
+            <br>
+            <b>crossing_seg.onnx</b> — runs on the Node server via <code>/api/infer</code>:
+            cyan dotted-line segmentation masks, the corridor arrow toward the vanishing point,
+            and the light-state banner.
+            <br>
+            Both read the same webcam. Uncheck the crossing model to give pedestrian.onnx the whole machine.
+        </div>
+    </div>
+
+    <!-- crossing.js exposes window.Crossing; webcam.js starts it and owns pedestrian.onnx -->
+    <script src="js/crossing.js"></script>
+    <script src="js/webcam.js"></script>
+</body>
+</html>

@@ -3,12 +3,16 @@
  * OWNER: Darrshini
  *
  * Responsibilities:
- * 1. Connect to Node.js server via WebSocket
- * 2. Receive sensor data from ESP32 (IMU, heartbeat, camera frames)
+ * 1. Connect to the Node.js server over the /live WebSocket
+ * 2. Receive camera frames (binary JPEG) and crossing results from the Raspberry
+ *    Pi Zero 2W glasses, via the server
  * 3. Get GPS location from phone browser API
- * 4. Send haptic motor commands back to ESP32
+ * 4. Send haptic motor commands back to the Pi
  * 5. Manage app state machine
  * 6. Audio announcements for accessibility
+ *
+ * Heading comes from the PHONE's compass (DeviceOrientationEvent), not from an
+ * IMU on the glasses -- see handleImuReading / the heading section below.
  */
 
 // ============================================================
@@ -73,19 +77,31 @@ const GESTURE_RULES = {
 // ============================================================
 
 let ws = null;
-const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/browser';
+// /live, not the old /browser. The glasses are a Raspberry Pi Zero 2W now, and
+// it sends each JPEG as a BINARY WebSocket frame -- raw bytes, no base64, no
+// JSON envelope (see navassist_pi_camera.py for why: base64 inflates every frame
+// 33%, and on the Zero 2W's 2.4GHz-only WiFi that inflation was the throughput
+// ceiling). The server relays those bytes to us untouched, and pushes the
+// crossing model's results down the same socket as JSON.
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/live';
 
 function connectWebSocket() {
     ws = new WebSocket(WS_URL);
+    ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
         debugLog('Connected to server');
     };
 
     ws.onmessage = (event) => {
+        // Binary => a JPEG frame from the Pi. Text => JSON (crossing results,
+        // heartbeats, connection events).
+        if (typeof event.data !== 'string') {
+            if (typeof handleCameraFrame === 'function') handleCameraFrame(event.data);
+            return;
+        }
         try {
-            const envelope = JSON.parse(event.data);
-            handleIncomingMessage(envelope);
+            handleIncomingMessage(JSON.parse(event.data));
         } catch (e) {
             debugLog('Parse error: ' + e.message);
         }
@@ -99,7 +115,9 @@ function connectWebSocket() {
     ws.onerror = () => ws.close();
 }
 
-function sendToEsp32(topic, payload) {
+// Browser → Pi (haptic commands). The server forwards anything that isn't
+// live/config straight on to the Pi, which handles it in read_commands().
+function sendToPi(topic, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     ws.send(JSON.stringify({ topic, timestamp: Date.now(), payload }));
 }
@@ -108,14 +126,18 @@ function sendToEsp32(topic, payload) {
 // Incoming message router
 // ============================================================
 
+// Camera frames are NOT routed here -- they arrive as binary, handled in
+// ws.onmessage above. Everything on this socket that is text is JSON.
 function handleIncomingMessage(envelope) {
     switch (envelope.topic) {
         case 'connection/event': handleConnectionEvent(envelope.payload); break;
         case 'system/heartbeat': handleHeartbeat(envelope.payload); break;
         case 'imu/orientation':  handleImuReading(envelope.payload); break;
-        case 'camera/image':
-            if (typeof handleCameraFrame === 'function') {
-                handleCameraFrame(envelope.payload);
+        case 'crossing/result':
+            // The server ran crossing_seg.onnx on the frame the Pi sent it and
+            // pushed the result. ai.js folds it into the state machine.
+            if (window.navassist.handleCrossingResult) {
+                window.navassist.handleCrossingResult(envelope.payload);
             }
             break;
         default:
@@ -133,12 +155,19 @@ function handleConnectionEvent(payload) {
     const event = payload.event;
     debugLog('Connection: ' + event);
 
-    if (event === 'esp32_connected') {
+    // The server tells us the angle it rotates Pi frames by, and it is the single
+    // source of truth for it. Handing it to ai.js is what stops the server's
+    // coordinates and our canvas silently disagreeing about which way is up.
+    if (typeof payload.rotate === 'number' && window.navassist.setFrameRotation) {
+        window.navassist.setFrameRotation(payload.rotate);
+    }
+
+    if (event === 'pi_connected') {
         clearTimeout(heartbeatTimer);
         updateConnectionStatus(true);
         speak('Glasses connected successfully. Tap anywhere to start scanning.', true);
         transitionTo(STATES.READY);
-    } else if (event === 'esp32_disconnected') {
+    } else if (event === 'pi_disconnected') {
         updateConnectionStatus(false);
         if (pendingConfirmation) {
             pendingConfirmation = null;
@@ -168,7 +197,7 @@ function handleHeartbeat(payload) {
     clearTimeout(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
         debugLog('Heartbeat timeout');
-        handleConnectionEvent({ event: 'esp32_disconnected' });
+        handleConnectionEvent({ event: 'pi_disconnected' });
     }, 6000);
 }
 
@@ -606,7 +635,7 @@ function haversineMeters(lat1, lng1, lat2, lng2) {
 function sendHaptic(motor, pattern, intensity, durationMs) {
     intensity = intensity || 0.8;
     durationMs = durationMs || 300;
-    sendToEsp32('haptic/command', { motor, pattern, intensity, duration_ms: durationMs });
+    sendToPi('haptic/command', { motor, pattern, intensity, duration_ms: durationMs });
     debugLog('Haptic: ' + motor);
 }
 
@@ -675,26 +704,38 @@ window.navassist.onGreenDetected = function(direction) {
     }
 };
 
-// Called by ai.js on every frame where a green man is detected while WAITING
-// (before the user has double-tapped to confirm crossing). Gives a light
-// directional nudge toward which side the green man is on -- distinct from
-// onGreenDetected's strong 'both' pulse, which signals "you may cross" once.
+// Called by ai.js on every frame where a green man is detected. Gives a light
+// directional nudge toward whichever side the green man is on -- this is the
+// haptic that matches the "GREEN — GO LEFT/RIGHT" banner ai.js draws.
+//
+// Fires while SCANNING or WAITING:
+//   * SCANNING -- so the REAL app (index.html) buzzes toward a green man the
+//     moment it's seen off to one side, without first walking the whole
+//     GPS -> confirm -> navigate -> reach chain. This is what makes "point the
+//     camera at a green man on the left and feel the left motor" work directly.
+//   * WAITING  -- the original behaviour, once the user is standing at the
+//     crossing waiting for the signal.
+// NOT in NAVIGATING/CROSSING: those states have their OWN directional haptics
+// (onDirectionDecided toward the post, onCorridorDirection along the crossing),
+// and a second green-man buzz on top would fight them.
+//
 // Has its OWN cooldown here (not in ai.js) since ai.js calls this every frame
-// -- without throttling, this would buzz continuously while WAITING.
+// -- without throttling, this would buzz continuously while a green man is in view.
 let lastGreenDirectionHapticAt = 0;
 const GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000;
 
 window.navassist.onGreenDirection = function(direction) {
-    if (currentState !== STATES.WAITING) return;
+    if (currentState !== STATES.WAITING && currentState !== STATES.SCANNING) return;
     const now = Date.now();
     if (now - lastGreenDirectionHapticAt < GREEN_DIRECTION_HAPTIC_COOLDOWN_MS) return;
     lastGreenDirectionHapticAt = now;
 
-    // CENTRE isn't buzzed here -- onGreenDetected's strong pulse (fired
-    // separately, once, on first detection) already covers the straight-
-    // ahead "go" case without needing a repeated nudge on top of it.
+    // Left/right buzz the matching side; CENTRE buzzes both softly so "go
+    // straight" still has a cue (the banner shows GO CENTRE for a green man
+    // dead ahead). getDirection() in ai.js splits at 0.4 / 0.6 of frame width.
     if (direction === 'LEFT')       sendHaptic('left',  'pulse', 0.5, 200);
     else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.5, 200);
+    else                            sendHaptic('both',  'pulse', 0.3, 200);
 };
 
 // Called by ai.js when green is detected but flashing -- i.e. the signal is

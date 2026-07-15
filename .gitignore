@@ -3,5 +3,9 @@ node_modules/
 .DS_Store
 *.log
 
+# Python bytecode cache (navassist_pi_camera.py etc.)
+__pycache__/
+*.pyc
+
 # Claude Code local tooling (preview/dev-server config) -- keep out of the shared repo
 .claude/

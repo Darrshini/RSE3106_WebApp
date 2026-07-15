@@ -1,6 +1,6 @@
 /**
  * NavAssist — ai.js
- * OWNER: Kim Hyeonghu (adapted: ESP32 camera frames instead of laptop webcam)
+ * OWNER: Kim Hyeonghu (adapted: Raspberry Pi camera frames instead of laptop webcam)
  *
  * Camera processing + AI inference + direction logic.
  *
@@ -8,15 +8,25 @@
  * (red / green / traffic-light). onnxruntime-web runs the model inside
  * js/inference.worker.js (a Web Worker), NOT on this thread, so inference
  * never freezes the camera feed / gestures / heartbeat. Video source is the
- * glasses camera, delivered as base64 JPEG frames over the WebSocket relay
- * (topic 'camera/image'), NOT the laptop/phone's own webcam.
+ * glasses camera (Pi Zero 2W + Camera Module v3), delivered as raw JPEG bytes
+ * over the /live WebSocket, NOT the laptop/phone's own webcam.
+ *
+ * TWO MODELS, TWO MACHINES, ONE FRAME. Neither runs on the Pi -- a Zero 2W is
+ * 4x Cortex-A53 @1GHz, where a YOLO11 pass takes seconds, not milliseconds:
+ *   pedestrian.onnx    HERE, in the browser (js/inference.worker.js).
+ *   crossing_seg.onnx  on the NODE SERVER, against the same JPEG the Pi already
+ *                      sent it. We never upload a frame back -- the server has
+ *                      it already, so results simply arrive on the socket as
+ *                      'crossing/result' and app.js routes them to
+ *                      handleCrossingResult() below.
  *
  * Flow:
- *   1. app.js calls handleCameraFrame(payload) every time a 'camera/image'
- *      message arrives from the glasses.
- *   2. Each frame is decoded into an Image, drawn onto the #camFrame canvas,
- *      and (throttled to INFER_EVERY_MS) pre-processed and handed to the
- *      inference worker, which runs the model and returns detections.
+ *   1. app.js calls handleCameraFrame(buf) with the raw JPEG bytes of every
+ *      binary frame that arrives on /live.
+ *   2. Each frame is decoded (off-thread, via createImageBitmap), rotated
+ *      upright, drawn onto the #camFrame canvas, and -- throttled to
+ *      INFER_EVERY_MS -- pre-processed and handed to the inference worker,
+ *      which runs the model and returns detections.
  *   3. Detections are drawn on the #camOverlay canvas: bounding boxes,
  *      a direction arrow to the strongest GREEN light, and a status HUD.
  *   4. FSM callbacks (window.navassist.*) drive app.js's state machine and
@@ -60,28 +70,38 @@ let workerReady = false;      // true once the worker has loaded the model
 let inferBusy = false;        // true while the worker is mid-inference (one at a time)
 let frameCanvas, overlay, frameCtx, octx;
 let preCanvas, preCtx;        // offscreen canvas for letterbox pre-processing
+// Crossing-model overlay: a THIRD canvas (#crossOverlay), below the pedestrian
+// overlay, on which we draw the server's crossing_seg.onnx output -- the same
+// visuals pi.html shows. Draw-only: app.js owns the decisions (see
+// handleCrossingPerception). maskCanvas unpacks each bit-packed segmentation
+// mask before it's stretched onto the overlay.
+let crossOverlay, crossCtx, crossMaskCanvas, crossMaskCtx;
+let lastCrossDrawAt = 0;      // performance.now() of the last crossing result drawn (for stale-clear)
 let latestDetections = [];
 let latestFrameImg = null;    // inference source: the frameCanvas AFTER rotation
-let decodeInFlight = false;   // true while an Image is mid-decode (frame-drop guard)
-let pendingB64 = null;        // newest frame that arrived while a decode was in flight
+let decodeInFlight = false;   // true while a frame is mid-decode (frame-drop guard)
+let pendingFrame = null;      // newest frame that arrived while a decode was in flight
 
-// The camera is mounted sideways, so every incoming frame is rotated 90°
-// CLOCKWISE at the one point it enters (decodeFrame). The rotated frame then
-// feeds the display, the browser worker, AND the server /api/infer model, so
-// the feed and the AI always agree on orientation. Set false if the camera is
-// ever remounted upright.
-const ROTATE_FRAME_CW90 = true;
+// The camera is mounted sideways on the glasses, so frames land 90° CCW of
+// upright and every incoming frame is rotated back at the one point it enters
+// (decodeFrame). The Pi deliberately does NOT rotate: libcamera's hardware
+// transform can't do a quarter turn, so rotating there would mean a software
+// re-encode and the loss of the hardware JPEG encoder -- the whole reason a Zero
+// 2W keeps up at all. Here it's free (the GPU does it), and on the server it's
+// free too (it decodes the JPEG anyway).
+//
+// The SERVER is the single source of truth for the angle: it sends its PI_ROTATE
+// on connect and app.js hands it to setFrameRotation(). Both ends therefore
+// always agree on which way is up, so the boxes can't silently land sideways.
+let rotateDeg = 90;
 
-// Server-side crossing perception (/api/infer -- dotted-line corridor +
-// light-state reading via segmentation model). Runs independently of, and
-// in parallel with, the client-side pedestrian.onnx inference above -- this
-// ADDS dotted-line corridor guidance and a more accurate flashing-light
-// read; it does not replace the existing traffic-light-post detection used
-// during SCANNING.
-let crossingInferInFlight = false;
-let lastCrossingInferAt = 0;
+// Server-side crossing perception -- dotted-line corridor + light-state reading
+// via the YOLO11-seg model. Runs on the SERVER, on the frame the Pi already sent
+// it, and arrives here as pushed 'crossing/result' messages (see
+// handleCrossingResult). Independent of, and parallel to, the pedestrian.onnx
+// inference above: it ADDS corridor guidance and a more accurate flashing-light
+// read; it does not replace the traffic-light-post detection used in SCANNING.
 let noDashStreak = 0;
-const CROSSING_INFER_INTERVAL_MS = 200;   // separate throttle from the onnx worker inference
 const END_NO_DASH_FRAMES = 6;             // consecutive no-dash frames before treating it as "corridor ran out"
 const END_LIGHT_AREA_FRAC = 0.02;         // light this big in frame => plausibly at the far side
 let started = false;
@@ -106,6 +126,10 @@ const ORT_WASM_PATHS = 'vendor/onnxruntime/';
 // ============================================================
 window.navassist = window.navassist || {};
 window.navassist.startCameraAI = startCameraAI;
+// Called by app.js when the server reports the rotation it applies to Pi frames.
+window.navassist.setFrameRotation = (deg) => { rotateDeg = deg; };
+// Called by app.js for every 'crossing/result' the server pushes down /live.
+window.navassist.handleCrossingResult = handleCrossingPerception;
 
 // Kick off model loading on the first user gesture (keeps behaviour consistent
 // with the splash-tap pattern the rest of the app uses; no getUserMedia needed
@@ -119,7 +143,7 @@ window.addEventListener('load', () => {
 });
 
 // ============================================================
-// Model bootstrap (no camera acquisition here — frames come from ESP32)
+// Model bootstrap (no camera acquisition here — frames come from the Pi)
 // ============================================================
 function startCameraAI() {
     if (started) return;
@@ -130,6 +154,15 @@ function startCameraAI() {
     if (!frameCanvas || !overlay) { started = false; return; }
     frameCtx = frameCanvas.getContext('2d');
     octx     = overlay.getContext('2d');
+
+    // Optional: only present on index.html. If it's missing (e.g. a page that
+    // reuses ai.js without it) the crossing draw path simply no-ops.
+    crossOverlay = document.getElementById('crossOverlay');
+    if (crossOverlay) {
+        crossCtx = crossOverlay.getContext('2d');
+        crossMaskCanvas = document.createElement('canvas');
+        crossMaskCtx = crossMaskCanvas.getContext('2d');
+    }
 
     preCanvas = document.createElement('canvas');
     preCanvas.width = preCanvas.height = INPUT_SIZE;
@@ -172,7 +205,7 @@ function handleWorkerMessage(e) {
         case 'ready':
             workerReady = true;
             backend = msg.backend || '?';   // 'webgpu' or 'wasm' — shown in the HUD
-            modelStatus = 'waiting-esp32';
+            modelStatus = 'waiting-pi';
             setContext('Model ready (' + backend + '). Waiting for glasses camera feed…');
             requestAnimationFrame(renderLoop);   // draw overlay every frame (smooth)
             break;
@@ -198,65 +231,75 @@ function handleWorkerMessage(e) {
 }
 
 // ============================================================
-// Camera frame ingestion — called by app.js on every 'camera/image' message
+// Camera frame ingestion — called by app.js for every binary frame on /live
 // ============================================================
-function handleCameraFrame(payload) {
-    // Payload is base64 JPEG per README. Handle both a raw string and an
-    // object wrapper until the exact firmware shape is confirmed.
-    const b64 = typeof payload === 'string' ? payload : (payload.image || payload.data || payload.frame);
-    if (!b64) return;
+// `buf` is an ArrayBuffer of raw JPEG bytes, straight from the Pi, byte for
+// byte. It is NOT base64: the old ESP32 protocol wrapped each frame in
+// {"topic":"camera/image","payload":"<base64>"}, which inflates every frame 33%
+// and makes both ends parse a ~100KB string per frame. On the Zero 2W's
+// 2.4GHz-only WiFi that inflation was the actual throughput ceiling.
+function handleCameraFrame(buf) {
+    if (!buf || !buf.byteLength) return;
 
     // Frame-drop guard: only ever decode ONE frame at a time. If a decode is
     // already running, stash just the newest frame and drop everything that
     // arrived in between -- we only care about the latest. Without this, a
-    // camera that sends frames faster than the main thread can decode/draw
-    // them (the Pi + Camera Module v3 does, unlike the old ~1fps ESP32-CAM)
-    // builds an ever-growing backlog and the on-screen feed falls further and
-    // further behind reality. That's the "laggy only through the webserver"
-    // symptom: the camera is fine, the browser consumer just can't keep up.
+    // camera that sends frames faster than we can decode/draw them (the Pi at
+    // 15fps does, unlike the old ~1fps ESP32-CAM) builds an ever-growing
+    // backlog and the on-screen feed falls further and further behind reality.
+    // That's the "laggy only through the webserver" symptom: the camera is
+    // fine, the browser consumer just can't keep up. Dropping is always right
+    // here -- a fresher frame is already on its way.
     if (decodeInFlight) {
-        pendingB64 = b64;
+        pendingFrame = buf;
         return;
     }
-    decodeFrame(b64);
+    decodeFrame(buf);
 }
 
-function decodeFrame(b64) {
+function decodeFrame(buf) {
     decodeInFlight = true;
-    const img = new Image();
-    img.onload = () => {
-        // Rotate 90° clockwise here, at the single entry point, so the display
-        // AND both models (browser worker + server /api/infer) all see the same
-        // upright frame. When rotated, width/height swap. frameCanvas holds the
-        // rotated frame and doubles as the inference source and the /api/infer
-        // payload.
-        const rot = ROTATE_FRAME_CW90;
-        const cw = rot ? img.height : img.width;    // display/canvas width
-        const ch = rot ? img.width  : img.height;   // display/canvas height
-        if (frameCanvas.width !== cw || frameCanvas.height !== ch) {
-            frameCanvas.width = overlay.width = cw;
-            frameCanvas.height = overlay.height = ch;
-            const cv = overlay.parentElement;
-            if (cv && cw) cv.style.aspectRatio = cw + ' / ' + ch;
-        }
-        frameCtx.save();
-        if (rot) {
-            frameCtx.translate(cw, 0);              // 90° CW: move origin to top-right
-            frameCtx.rotate(Math.PI / 2);
-        }
-        frameCtx.drawImage(img, 0, 0);
-        frameCtx.restore();
-        latestFrameImg = frameCanvas;               // rotated frame is the inference source
-        if (modelStatus === 'waiting-esp32') modelStatus = 'ready';
-        maybeRunInference();                        // browser worker (pedestrian.onnx)
-        maybeRunCrossingInfer();                    // server seg model (/api/infer)
-        onDecodeSettled();
-    };
-    img.onerror = () => {
-        window.navassist.debugLog && window.navassist.debugLog('Bad frame: failed to decode JPEG');
-        onDecodeSettled();
-    };
-    img.src = 'data:image/jpeg;base64,' + b64;
+    // createImageBitmap decodes OFF the main thread. The old path -- new Image()
+    // with a data: URL -- forced a base64 round trip through a string and decoded
+    // on the main thread, which is a real cost at 15fps.
+    createImageBitmap(new Blob([buf], { type: 'image/jpeg' }))
+        .then(drawFrame)
+        .catch(() => {
+            // A torn/partial JPEG. Skip it; another is right behind it.
+            window.navassist.debugLog && window.navassist.debugLog('Bad frame: failed to decode JPEG');
+        })
+        .finally(onDecodeSettled);
+}
+
+// Rotate the frame upright here, at the single point it enters, so the display
+// AND the browser worker agree with the server's coordinates (the server rotates
+// the same frame by the same angle inside its own pipeline). A quarter turn
+// swaps width and height.
+function drawFrame(bmp) {
+    const quarter = (rotateDeg === 90 || rotateDeg === 270);
+    const cw = quarter ? bmp.height : bmp.width;    // display/canvas width
+    const ch = quarter ? bmp.width  : bmp.height;   // display/canvas height
+    if (frameCanvas.width !== cw || frameCanvas.height !== ch) {
+        frameCanvas.width = overlay.width = cw;
+        frameCanvas.height = overlay.height = ch;
+        const cv = overlay.parentElement;
+        if (cv && cw) cv.style.aspectRatio = cw + ' / ' + ch;
+    }
+
+    frameCtx.save();
+    if (rotateDeg === 90)       { frameCtx.translate(cw, 0);  frameCtx.rotate(Math.PI / 2); }
+    else if (rotateDeg === 180) { frameCtx.translate(cw, ch); frameCtx.rotate(Math.PI); }
+    else if (rotateDeg === 270) { frameCtx.translate(0, ch);  frameCtx.rotate(-Math.PI / 2); }
+    frameCtx.drawImage(bmp, 0, 0);
+    frameCtx.restore();
+    bmp.close();                                    // release the decoded frame immediately
+
+    latestFrameImg = frameCanvas;                   // rotated frame is the inference source
+    if (modelStatus === 'waiting-pi') modelStatus = 'ready';
+    maybeRunInference();                            // browser worker (pedestrian.onnx)
+    // No crossing call here: the server already has this exact frame and runs
+    // crossing_seg.onnx on it unprompted, pushing 'crossing/result' back down
+    // /live. Re-encoding and uploading it would be a pointless round trip.
 }
 
 // After a decode finishes (success or failure), immediately pick up the newest
@@ -264,9 +307,9 @@ function decodeFrame(b64) {
 // fresh as possible while still never running two decodes concurrently.
 function onDecodeSettled() {
     decodeInFlight = false;
-    if (pendingB64 !== null) {
-        const next = pendingB64;
-        pendingB64 = null;
+    if (pendingFrame !== null) {
+        const next = pendingFrame;
+        pendingFrame = null;
         decodeFrame(next);
     }
 }
@@ -274,43 +317,24 @@ function onDecodeSettled() {
 // ============================================================
 // Server-side crossing perception (dotted-line corridor + light state)
 // ============================================================
-async function maybeRunCrossingInfer() {
-    if (crossingInferInFlight || !latestFrameImg) return;
-    const now = performance.now();
-    if (now - lastCrossingInferAt < CROSSING_INFER_INTERVAL_MS) return;
-    lastCrossingInferAt = now;
-    crossingInferInFlight = true;
-
-    try {
-        // Send the ROTATED frame (what's on frameCanvas) so the server model
-        // sees the same orientation as the display and the browser worker.
-        // Re-encode at modest quality to keep this frequent POST small.
-        const dataUrl = frameCanvas.toDataURL('image/jpeg', 0.7);
-        const res = await fetch('/api/infer', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: dataUrl })
-        });
-        if (res.ok) {
-            const result = await res.json();
-            if (result && result.w) handleCrossingPerception(result);
-        }
-    } catch (e) {
-        // Server-side perception is an ADDITION, not a dependency -- if it's
-        // slow, down, or the network drops, the existing client-side
-        // pipeline (traffic-light-post detection, phone-compass drift
-        // correction) keeps working on its own. Fail silently, don't block
-        // or retry-storm.
-        window.navassist.debugLog && window.navassist.debugLog('Crossing infer error: ' + e.message);
-    } finally {
-        crossingInferInFlight = false;
-    }
-}
-
+// Nothing to call and nothing to upload: the server runs crossing_seg.onnx on
+// the Pi frames it is already relaying, and pushes each result down /live.
+// app.js routes them straight here via window.navassist.handleCrossingResult.
+//
+// Server-side perception is an ADDITION, not a dependency -- if the model is
+// slow or the results stop arriving, the client-side pipeline (traffic-light-post
+// detection, phone-compass drift correction) keeps working on its own.
+//
 // Routes server-side perception into app.js's existing, already
 // safety-gated callbacks -- this file never decides or speaks on its own
 // behalf, same pattern as every other detection path in this file.
 function handleCrossingPerception(result) {
+    // Draw the crossing model's output on every result, regardless of app state,
+    // so the second model is visibly working the moment the Pi is streaming --
+    // exactly like pi.html. This is purely a view; the decision/speech logic
+    // below is unchanged and remains the single source of truth.
+    drawCrossingOverlay(result);
+
     const state = window.navassist.currentState && window.navassist.currentState();
     const STATES = window.navassist.STATES;
     if (!state || !STATES) return;
@@ -356,6 +380,79 @@ function handleCrossingPerception(result) {
             window.navassist.onVisionArrivalSignal && window.navassist.onVisionArrivalSignal();
         }
     }
+}
+
+// ============================================================
+// Crossing-model overlay (draw-only) — mirrors pi.html's crossing.js visuals
+// ============================================================
+// index.html previously consumed crossing/result for DECISIONS only and never
+// drew it, so the page looked like it ran a single model. This renders the same
+// three things pi.html does -- cyan dotted-line segmentation masks, the corridor
+// arrow, and the pedestrian-light box coloured by state -- on the dedicated
+// #crossOverlay layer (below the pedestrian boxes). It deliberately runs NO
+// state machine and speaks nothing: app.js already owns every decision, so this
+// duplicates only the drawing, not crossing.js's FSM. Coordinates are the
+// server's upright r.w x r.h space, the SAME space the rotated #camFrame and the
+// #camOverlay use, so all three layers line up (see the rotation notes above).
+function drawCrossingOverlay(r) {
+    if (!crossCtx || !r || !r.w) return;
+    if (crossOverlay.width !== r.w || crossOverlay.height !== r.h) {
+        crossOverlay.width = r.w; crossOverlay.height = r.h;
+    }
+    const W = crossOverlay.width, H = crossOverlay.height;
+    const lw = Math.max(2, W * 0.004), fp = Math.max(13, Math.round(W * 0.022));
+    crossCtx.clearRect(0, 0, W, H);
+
+    if (r.dotted) for (const d of r.dotted) if (d.mask) drawCrossMask(d.mask);
+
+    if (r.light && r.light.box) {
+        const st = r.light.state;   // GREEN | GREENRED | RED | NONE
+        const col = st === 'GREEN' ? '#00e676' : st === 'RED' ? '#ff1744'
+                  : st === 'GREENRED' ? '#ffab00' : '#9e9e9e';
+        const b = r.light.box;
+        crossCtx.lineWidth = lw * 1.3; crossCtx.strokeStyle = col;
+        crossCtx.strokeRect(b[0], b[1], b[2] - b[0], b[3] - b[1]);
+        drawCrossTag('light ' + st, b[0], b[1], col, fp);
+    }
+    if (r.corridor && r.corridor.has) drawCrossArrow(r.corridor.near, r.corridor.far, '#00e5ff', W);
+
+    lastCrossDrawAt = performance.now();
+}
+
+// Unpack a bit-packed segmentation bitmap into a small canvas, then stretch it
+// (smoothed) onto its box in overlay coords. Ported from crossing.js drawMask().
+function drawCrossMask(m) {
+    crossMaskCanvas.width = m.mw; crossMaskCanvas.height = m.mh;
+    const n = m.mw * m.mh, bin = atob(m.data);
+    const img = crossMaskCtx.createImageData(m.mw, m.mh), dt = img.data;
+    for (let i = 0; i < n; i++) {
+        if ((bin.charCodeAt(i >> 3) >> (i & 7)) & 1) {
+            const o = i * 4; dt[o] = 0; dt[o + 1] = 224; dt[o + 2] = 255; dt[o + 3] = 125;
+        }
+    }
+    crossMaskCtx.putImageData(img, 0, 0);
+    const b = m.box;
+    crossCtx.imageSmoothingEnabled = true;
+    crossCtx.drawImage(crossMaskCanvas, b[0], b[1], b[2] - b[0], b[3] - b[1]);
+}
+
+function drawCrossArrow(a, b, color, W) {
+    const head = Math.max(14, W * 0.03), ang = Math.atan2(b.y - a.y, b.x - a.x);
+    crossCtx.strokeStyle = color; crossCtx.fillStyle = color;
+    crossCtx.lineWidth = Math.max(4, W * 0.008); crossCtx.lineCap = 'round';
+    crossCtx.beginPath(); crossCtx.moveTo(a.x, a.y); crossCtx.lineTo(b.x, b.y); crossCtx.stroke();
+    crossCtx.beginPath(); crossCtx.moveTo(b.x, b.y);
+    crossCtx.lineTo(b.x - head * Math.cos(ang - Math.PI / 6), b.y - head * Math.sin(ang - Math.PI / 6));
+    crossCtx.lineTo(b.x - head * Math.cos(ang + Math.PI / 6), b.y - head * Math.sin(ang + Math.PI / 6));
+    crossCtx.closePath(); crossCtx.fill();
+    crossCtx.beginPath(); crossCtx.arc(a.x, a.y, Math.max(5, W * 0.01), 0, 6.283); crossCtx.fill();
+}
+
+function drawCrossTag(text, x, y, color, fp) {
+    crossCtx.font = 'bold ' + fp + 'px sans-serif';
+    const tw = crossCtx.measureText(text).width, ty = Math.max(y, fp + 6);
+    crossCtx.fillStyle = color; crossCtx.fillRect(x, ty - fp - 6, tw + 10, fp + 6);
+    crossCtx.fillStyle = '#000'; crossCtx.fillText(text, x + 5, ty - 6);
 }
 
 // ============================================================
@@ -414,6 +511,13 @@ function renderLoop(ts) {
     if (lastFrameTs) fps = 0.9 * fps + 0.1 * (1000 / (ts - lastFrameTs));
     lastFrameTs = ts;
     drawOverlay(latestDetections);
+    // Crossing results arrive only as fast as the server infers; if they stop
+    // (Pi disconnected), clear the crossing layer once so a stale mask/arrow
+    // doesn't sit frozen over a dead feed.
+    if (crossCtx && lastCrossDrawAt && performance.now() - lastCrossDrawAt > 1500) {
+        crossCtx.clearRect(0, 0, crossOverlay.width, crossOverlay.height);
+        lastCrossDrawAt = 0;
+    }
     requestAnimationFrame(renderLoop);
 }
 
