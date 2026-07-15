@@ -1113,9 +1113,9 @@ window.addEventListener('load', async () => {
 
         setTimeout(() => {
             if (cameFromSettings) {
-                speak('NavAssist. Settings saved. Tap anywhere to start.', false);
+                speak('Settings saved. Tap anywhere to start.', false);
             } else {
-                speak('NavAssist. Assistive navigation for pedestrian crossings. Tap anywhere to start.', false);
+                speak('I am TOPH. Your Traffic Optical Personal Helper. Tap anywhere to start.', false);
             }
         }, 500);
 
