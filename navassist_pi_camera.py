@@ -360,12 +360,20 @@ def start_camera(args, bus):
     try:
         from libcamera import controls as libcontrols
 
-        # Camera Module v3 has autofocus, and it matters: the pedestrian light we
-        # care about is across the road, and the v3 ships focused much nearer than
-        # that. Continuous AF keeps it sharp as the wearer moves. Silently skipped
-        # on a v2, which is fixed-focus and has no such control.
-        picam2.set_controls({"AfMode": libcontrols.AfModeEnum.Continuous})
-        print("[cam] continuous autofocus enabled")
+        # Camera Module v3 has autofocus, but we PIN IT AT INFINITY rather than let
+        # it hunt: the pedestrian light we care about is across the road (far), and
+        # continuous AF wastes time racking focus onto near clutter -- the wearer's
+        # own body, passers-by, a hand -- and can be caught mid-hunt (blurred) at
+        # exactly the moment a light appears. Manual focus held at infinity is sharp
+        # for everything from a few metres out to the horizon, which is the whole
+        # range that matters here. LensPosition is in DIOPTRES (1/metres), so 0.0 =
+        # infinity. Silently skipped on a v2 (fixed focus, no such control) -- which
+        # is already focused near infinity anyway.
+        picam2.set_controls({
+            "AfMode": libcontrols.AfModeEnum.Manual,
+            "LensPosition": 0.0,          # dioptres; 0.0 = focus at infinity
+        })
+        print("[cam] focus fixed at infinity (manual, LensPosition 0.0)")
 
         # AE mode + metering. 'Normal' is the standard AE loop (as opposed to Short/
         # Long, which bias the exposure/gain tradeoff). Centre-weighted metering is

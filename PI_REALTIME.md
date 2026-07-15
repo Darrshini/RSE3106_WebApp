@@ -232,10 +232,13 @@ Both ends print once a second, and together they tell you exactly where a bottle
   AWS box's HTTPS solves this properly.
 - **First load stalls for a few seconds.** `pedestrian.onnx` is ~38 MB and must download before
   the worker signals ready. Normal, not a hang.
-- **Camera Module v3 autofocus matters.** The v3 ships focused much nearer than the pedestrian
-  light across the road. The script enables continuous AF and prints
-  `[cam] continuous autofocus enabled`. On a v2 (fixed focus) it prints that the control is
-  unavailable, which is fine.
+- **Camera Module v3 focus is pinned at infinity.** The pedestrian light we care about is across
+  the road, so the script sets manual focus at infinity (`AfMode=Manual`, `LensPosition=0.0`
+  dioptres) rather than letting continuous AF hunt onto near clutter — the wearer's own body, a
+  passing hand — and get caught mid-hunt (blurred) exactly when a light appears. Infinity is sharp
+  from a few metres out to the horizon, which is the whole range that matters. It prints
+  `[cam] focus fixed at infinity (manual, LensPosition 0.0)`. On a v2 (fixed focus) the control is
+  unavailable and skipped, which is fine — a v2 is already focused near infinity.
 - **Seeing no detections?** Try `pi.html` and slide the confidence threshold down before
   concluding anything is broken. `model_test.html` drops its threshold to 0.08 specifically to
   chase near-misses, which tells you this model can score low on real scenes.
