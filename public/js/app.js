@@ -394,11 +394,6 @@ function completeCrossing() {
 }
 
 function startGpsTracking() {
-    if (location.protocol === 'http:' && location.hostname !== 'localhost') {
-        debugLog('GPS blocked on HTTP -- needs HTTPS');
-        return;
-    }
-
     if (!navigator.geolocation) {
         debugLog('GPS not available');
         return;
@@ -454,7 +449,7 @@ let nearbyCrossings = [];
 let selectedCrossingIndex = 0;
 
 async function resolveJunction() {
-    if (currentLocation && location.protocol === 'https:') {
+    if (currentLocation) {
         await resolveJunctionWithGPS();
     } else {
         resolveJunctionWithCameraOnly();

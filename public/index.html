@@ -47,10 +47,8 @@
                 <canvas id="camFrame"></canvas>
                 <!-- crossing_seg.onnx output, run on the SERVER against the frame
                      the Pi already sent it and pushed here over /live: dotted-line
-                     masks, corridor arrow, pedestrian-light box. Drawn here so the
-                     real app visibly runs BOTH models, exactly like pi.html. This
-                     is a view only -- app.js still owns every decision and every
-                     spoken cue; ai.js only renders onto this layer. -->
+                     masks, corridor arrow, pedestrian-light box coloured by state.
+                     ai.js draws the overlay AND fires FSM callbacks into app.js. -->
                 <canvas id="crossOverlay"></canvas>
                 <canvas id="camOverlay"></canvas>
             </div>
@@ -76,8 +74,6 @@
 
     </div>
 
-    <!-- onnxruntime-web is loaded INSIDE js/inference.worker.js (off the main
-         thread), not here — so the model never freezes the UI or the feed. -->
     <script src="js/app.js"></script>
     <script src="js/ai.js"></script>
 </body>

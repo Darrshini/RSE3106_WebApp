@@ -37,12 +37,10 @@ app.use(express.json({ limit: '15mb' })); // large limit for base64 camera frame
 // ============================================================
 
 // Non-secret runtime info the settings page can display. There are NO API keys
-// any more: both models run locally (pedestrian.onnx in the browser,
-// crossing_seg.onnx on this server) and map data comes from the keyless Overpass
-// API -- so nothing sensitive is served here. See README.
+// -- the model runs locally on this server and map data comes from the keyless
+// Overpass API, so nothing sensitive is served here. See README.
 app.get('/api/config', (req, res) => {
     res.json({
-        pedestrianModel: 'pedestrian.onnx (browser, onnxruntime-web)',
         crossingModel: 'crossing_seg.onnx (server, onnxruntime-node)',
     });
 });
