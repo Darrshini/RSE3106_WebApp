@@ -124,10 +124,11 @@ Both buttons are the only haptic path on that page. A traffic light detected on 
 **never** move a motor on its own. Same for `webcam.html`. That is by design, not a bug.
 
 Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states:
-- `onDirectionDecided` (`app.js:672`) returns immediately unless state is **`NAVIGATING`**
-- `onGreenDirection` (`app.js:717`) buzzes the green-man side only while **`WAITING`**
-- corridor drift-correction (`app.js:756`) requires **`CROSSING`**
-- reaching `NAVIGATING` means: detect a **traffic-light *post*** → **double-tap confirm**
+- `onDirectionDecided` (`app.js:629`) returns immediately unless state is **`NAVIGATING`**
+- `onGreenDirection` (`app.js:685`) buzzes the green-man side only while **`WAITING`**
+- corridor drift-correction (`app.js:725`) requires **`CROSSING`**
+- reaching `NAVIGATING` means: detect a **traffic-light *post*** → **automatic, no confirm** (the
+  crossing-selection double/triple-tap gate was removed)
 
 So opening `index.html`, pointing at a **green man**, and expecting a buzz will not work — you
 sit in `SCANNING`, where no haptic path exists, and a green man isn't even what advances SCANNING

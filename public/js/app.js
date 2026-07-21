@@ -35,14 +35,17 @@ async function loadConfig() {
 // State Machine
 // ============================================================
 
+// The crossing-SELECTION confirmation states (TARGET_DETECTED, CONFIRM_TARGET,
+// CHOOSE_POST) were removed: the app no longer asks the user to double/triple
+// tap to pick a crossing -- it identifies the crossing and heads straight for
+// it. The two SAFETY gates are kept, but as a single confirming tap each:
+// CONFIRM_CROSSING (tap to confirm you are crossing on the green man) and
+// CONFIRM_ARRIVAL (tap to confirm you felt the tactile indicators).
 const STATES = {
     IDLE:             'IDLE',
     READY:            'READY',
     SCANNING:         'SCANNING',
-    CHOOSE_POST:      'CHOOSE_POST',
     RESOLVING:        'RESOLVING',
-    TARGET_DETECTED:  'TARGET_DETECTED',
-    CONFIRM_TARGET:   'CONFIRM_TARGET',
     NAVIGATING:       'NAVIGATING',
     REACHED:          'REACHED',
     WAITING:          'WAITING',
@@ -63,11 +66,10 @@ function transitionTo(newState, message) {
     announceState(newState, message);
 }
 
+// Every remaining gesture is a single tap -- no double/triple taps anywhere.
 const GESTURE_RULES = {
     [STATES.READY]:            { single_tap: 'START_SCAN' },
-    [STATES.CONFIRM_TARGET]:   { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
-    [STATES.CHOOSE_POST]:      { double_tap: 'CHOOSE_LEFT', triple_tap: 'CHOOSE_RIGHT' },
-    [STATES.CONFIRM_CROSSING]: { double_tap: 'CONFIRM_YES', triple_tap: 'CONFIRM_NO' },
+    [STATES.CONFIRM_CROSSING]: { single_tap: 'CONFIRM_YES' },
     [STATES.CONFIRM_ARRIVAL]:  { single_tap: 'CONFIRM_YES' },
     [STATES.COMPLETED]:        { single_tap: 'RESET' }
 };
@@ -169,13 +171,6 @@ function handleConnectionEvent(payload) {
         transitionTo(STATES.READY);
     } else if (event === 'pi_disconnected') {
         updateConnectionStatus(false);
-        if (pendingConfirmation) {
-            pendingConfirmation = null;
-            if (pendingConfirmationTimerId) {
-                clearTimeout(pendingConfirmationTimerId);
-                pendingConfirmationTimerId = null;
-            }
-        }
         if (crossingStallCheckId) {
             clearInterval(crossingStallCheckId);
             crossingStallCheckId = null;
@@ -184,6 +179,7 @@ function handleConnectionEvent(payload) {
             clearTimeout(crossingFallbackTimerId);
             crossingFallbackTimerId = null;
         }
+        stopCrossingHaptics();
         if (currentState !== STATES.IDLE) {
             speak('Glasses disconnected. Please check the connection.', true);
             transitionTo(STATES.LOST_CONNECTION);
@@ -221,9 +217,23 @@ let lastTurnWarningAt = 0;
 const TURN_WARNING_COOLDOWN_MS = 5000;
 
 let crossingStartHeading = null;
-let lastCrossingHapticAt = 0;
 const CROSSING_DRIFT_THRESHOLD_DEG = 20;   // how far off-line before nudging
-const CROSSING_HAPTIC_COOLDOWN_MS = 1500;  // avoid buzzing on every reading
+
+// While CROSSING, guidance is a STEADY cadence rather than one buzz per frame:
+// a short pulse every CROSSING_HAPTIC_INTERVAL_MS on the side(s) matching the
+// current guidance direction -- both sides = go straight, one side = veer that
+// way. crossingDir is refreshed by the vision corridor (onCorridorDirection),
+// and, when the corridor isn't visible, by compass drift (checkHeadingDrift).
+// The buzz itself is emitted by crossingHapticTick() on the interval below.
+// A short pulse on a steady cadence: 0.5s buzz every 2s on the side(s) matching
+// crossingDir (both = straight ahead). Adjust the feel here -- lower INTERVAL
+// (or raise DURATION) for more continuous feedback, the reverse for sparser.
+const CROSSING_HAPTIC_INTERVAL_MS = 2000;   // re-fire the buzz every 2 seconds
+const CROSSING_HAPTIC_DURATION_MS = 500;    // each buzz lasts 0.5 seconds
+const CROSSING_HAPTIC_INTENSITY   = 0.7;
+const CROSSING_CORRIDOR_STALE_MS  = 1500;   // vision stays authoritative this long after each sighting
+let crossingDir = 'CENTRE';
+let lastCorridorAt = 0;
 
 // Signed shortest-path angle difference, handles 0/360 wraparound correctly
 function angleDiffDeg(a, b) {
@@ -274,20 +284,22 @@ function checkHeadingDrift() {
         }
     }
 
-    // Crossing drift correction: nudge the user back toward a straight line
-    // if their heading drifts too far from the heading captured the moment
-    // they started crossing. NOTE: verify the sign below (which motor fires
-    // for which drift direction) against the real motor wiring -- this
-    // assumes compass-style clockwise degrees, where a positive drift means
-    // the user turned right and needs a left-nudge to correct back.
-    if (currentState === STATES.CROSSING && crossingStartHeading !== null) {
+    // Crossing drift correction: steer the user back toward a straight line if
+    // their heading drifts too far from the heading captured the moment they
+    // started crossing. This is only a FALLBACK -- it runs only while the vision
+    // corridor is stale (not seen recently), since the dotted-line corridor is
+    // the primary guide when visible. It just updates crossingDir; the buzz is
+    // emitted on the steady cadence by crossingHapticTick().
+    // NOTE: verify the sign against the real motor wiring -- this assumes
+    // compass-style clockwise degrees, where a positive drift means the user
+    // turned right and should steer left to correct back.
+    if (currentState === STATES.CROSSING && crossingStartHeading !== null &&
+        Date.now() - lastCorridorAt > CROSSING_CORRIDOR_STALE_MS) {
         const drift = angleDiffDeg(currentHeading, crossingStartHeading);
-        const now = Date.now();
-        if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG &&
-            now - lastCrossingHapticAt > CROSSING_HAPTIC_COOLDOWN_MS) {
-            lastCrossingHapticAt = now;
-            if (drift > 0) sendHaptic('left', 'pulse', 0.6, 250);
-            else            sendHaptic('right', 'pulse', 0.6, 250);
+        if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG) {
+            crossingDir = drift > 0 ? 'LEFT' : 'RIGHT';
+        } else {
+            crossingDir = 'CENTRE';  // back on line -> go straight (both sides)
         }
     }
 }
@@ -327,6 +339,7 @@ let currentLocation = null;
 let crossingStartLocation = null;
 let crossingFallbackTimerId = null;
 let crossingStallCheckId = null;
+let crossingHapticTimerId = null;
 let lastCrossingDistance = 0;
 let lastCrossingProgressAt = 0;
 let crossingStallWarned = false;
@@ -380,6 +393,7 @@ function promptArrivalConfirmation() {
         clearInterval(crossingStallCheckId);
         crossingStallCheckId = null;
     }
+    stopCrossingHaptics();  // leaving CROSSING -> stop the steady guidance pulse
     transitionTo(STATES.CONFIRM_ARRIVAL,
         'You may have reached the other side. If you can feel the tactile ground indicators with your cane, tap once to confirm you have crossed safely.');
 }
@@ -582,35 +596,18 @@ function announceCurrentCrossing() {
         return;
     }
 
+    // Auto-select the nearest signal-controlled crossing -- there is no
+    // confirmation / "hear the next one" cycle anymore. Announce it and go
+    // straight to guiding the user toward it. (Replaces the removed
+    // TARGET_DETECTED -> CONFIRM_TARGET double/triple-tap selection.)
     const crossing = nearbyCrossings[selectedCrossingIndex];
     const distText = crossing.distance < 20
         ? 'very close'
         : 'about ' + Math.round(crossing.distance) + ' metres away';
 
-    const more = nearbyCrossings.length > 1
-        ? 'Triple tap to hear the next crossing. There are ' + nearbyCrossings.length + ' crossings nearby.'
-        : 'Triple tap if this is not correct.';
-
-    const message = 'Crossing found: ' + crossing.name + ', ' + distText + '. ' +
-        'Double tap to confirm this is your crossing. ' + more;
-
-    transitionTo(STATES.TARGET_DETECTED);
-    setTimeout(() => {
-        if (currentState === STATES.TARGET_DETECTED) {
-            transitionTo(STATES.CONFIRM_TARGET, message);
-        }
-    }, 1500);
-}
-
-function tryNextCrossing() {
-    if (nearbyCrossings.length <= 1) {
-        speak('No other crossings found nearby. Scanning again.');
-        transitionTo(STATES.RESOLVING);
-        setTimeout(resolveJunction, 1000);
-        return;
-    }
-    selectedCrossingIndex = (selectedCrossingIndex + 1) % nearbyCrossings.length;
-    announceCurrentCrossing();
+    navigatingStartHeading = currentHeading;
+    transitionTo(STATES.NAVIGATING,
+        'Crossing found: ' + crossing.name + ', ' + distText + '. Follow the haptic feedback.');
 }
 
 function haversineMeters(lat1, lng1, lat2, lng2) {
@@ -634,31 +631,45 @@ function sendHaptic(motor, pattern, intensity, durationMs) {
     debugLog('Haptic: ' + motor);
 }
 
+// The steady crossing-guidance pulse. Fires on CROSSING_HAPTIC_INTERVAL_MS and
+// buzzes for CROSSING_HAPTIC_DURATION_MS on the side(s) matching crossingDir:
+//   CENTRE (go straight) -> BOTH motors    LEFT -> left motor    RIGHT -> right
+// crossingDir is kept current by onCorridorDirection (vision) and, as a
+// fallback, checkHeadingDrift (compass). The cadence is fixed here so guidance
+// is one clean pulse every couple of seconds instead of one per camera frame.
+function crossingHapticTick() {
+    if (currentState !== STATES.CROSSING) { stopCrossingHaptics(); return; }
+    const motor = crossingDir === 'LEFT' ? 'left'
+                : crossingDir === 'RIGHT' ? 'right'
+                : 'both';
+    sendHaptic(motor, 'pulse', CROSSING_HAPTIC_INTENSITY, CROSSING_HAPTIC_DURATION_MS);
+}
+
+function startCrossingHaptics() {
+    stopCrossingHaptics();
+    crossingDir = 'CENTRE';   // start by guiding straight ahead (both sides)
+    lastCorridorAt = 0;       // no corridor seen yet -> compass fallback allowed immediately
+    crossingHapticTick();     // buzz once right away, then every interval
+    crossingHapticTimerId = setInterval(crossingHapticTick, CROSSING_HAPTIC_INTERVAL_MS);
+}
+
+function stopCrossingHaptics() {
+    if (crossingHapticTimerId) {
+        clearInterval(crossingHapticTimerId);
+        crossingHapticTimerId = null;
+    }
+}
+
 // Callbacks for ai.js
 window.navassist.onTrafficLightVisible = function(confidence) {
     if (currentState === STATES.SCANNING) {
-        const message = 'Traffic light post detected. ' +
-            'Double tap to confirm this is your crossing, triple tap to keep scanning.';
-        transitionTo(STATES.TARGET_DETECTED);
-        setTimeout(() => {
-            if (currentState === STATES.TARGET_DETECTED) {
-                transitionTo(STATES.CONFIRM_TARGET, message);
-            }
-        }, 1500);
+        // Traffic light post identified -- no selection/confirmation step;
+        // head straight for it. (The CONFIRM_TARGET double/triple-tap gate,
+        // and the two-post CHOOSE_POST picker, were removed.)
+        navigatingStartHeading = currentHeading;
+        transitionTo(STATES.NAVIGATING,
+            'Traffic light post detected. Follow the haptic feedback toward the crossing.');
     }
-};
-
-// Called by ai.js when exactly two traffic-light posts are visible at once,
-// clearly separated left/right -- instead of silently picking whichever one
-// scored higher confidence, the user actually gets to choose which one to
-// head toward. Goes through the same double-confirmation gate as every
-// other decision in the app (CHOOSE_LEFT/CHOOSE_RIGHT are wrapped by the
-// pending-confirmation layer above, same as CONFIRM_YES/CONFIRM_NO).
-window.navassist.onMultiplePostsChoice = function() {
-    if (currentState !== STATES.SCANNING) return;
-    transitionTo(STATES.CHOOSE_POST,
-        'Two traffic light posts detected: one on your left, one on your right. ' +
-        'Double tap to choose the left post, triple tap to choose the right post.');
 };
 
 // Haptic-only direction guidance while walking toward the traffic light post.
@@ -694,7 +705,7 @@ window.navassist.onGreenDetected = function(direction) {
         // "you may cross" wording and the confirm instruction.
         const dirText = (direction && direction !== 'CENTRE') ? ` to your ${direction.toLowerCase()}` : '';
         transitionTo(STATES.CONFIRM_CROSSING,
-            `Green man${dirText}. You may cross now. Double tap to confirm.`);
+            `Green man${dirText}. You may cross now. Tap once to confirm you are crossing.`);
         sendHaptic('both', 'pulse', 1.0, 800);
     }
 };
@@ -749,25 +760,18 @@ window.navassist.onGreenFlashing = function() {
     speak('The signal is ending soon. Please wait for the next green light.');
 };
 
-// Called by ai.js with dotted-line corridor direction from the server-side
-// segmentation model, while CROSSING. Deliberately shares the SAME cooldown
-// (lastCrossingHapticAt / CROSSING_HAPTIC_COOLDOWN_MS) as the phone-compass
-// heading-drift correction in checkHeadingDrift() -- whichever signal is
-// ready first within a given cooldown window fires, the other is skipped
-// for that window. This means vision-based corridor guidance and compass
-// drift correction never stack or fire competing haptic pulses at once;
-// when the dotted lines are visible they naturally take priority (they
-// update faster than GPS/compass), and compass drift correction still
-// covers moments where the corridor isn't visible (occlusion, etc).
+// Called by ai.js (per frame, while CROSSING) with the dotted-line corridor
+// direction from the server-side segmentation model. This no longer buzzes
+// directly -- it just records the latest guidance direction and when it was
+// seen. The actual pulse is emitted on a steady 2-second cadence by
+// crossingHapticTick(), so the wearer feels one clean directional buzz every
+// couple of seconds instead of one per camera frame. Vision stays authoritative
+// for CROSSING_CORRIDOR_STALE_MS after each sighting; only once it goes stale
+// does the compass-drift fallback in checkHeadingDrift() get to set crossingDir.
 window.navassist.onCorridorDirection = function(direction) {
     if (currentState !== STATES.CROSSING) return;
-    const now = Date.now();
-    if (now - lastCrossingHapticAt < CROSSING_HAPTIC_COOLDOWN_MS) return;
-    lastCrossingHapticAt = now;
-
-    if (direction === 'LEFT')       sendHaptic('left',  'pulse', 0.6, 250);
-    else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.6, 250);
-    // CENTRE: already tracking the corridor centreline, no correction needed
+    crossingDir = direction || 'CENTRE';
+    lastCorridorAt = Date.now();
 };
 
 // Called by ai.js when the dotted-line corridor runs out AND the light
@@ -785,8 +789,14 @@ window.navassist.onVisionArrivalSignal = function() {
 // ============================================================
 
 const TAP_WINDOW_MS = 400;
+// A real touch on a phone fires touchstart AND, a moment later, a synthesized
+// click. We listen for both (so laptops, which only fire click, still work),
+// but must count each physical tap ONCE -- otherwise a single tap registers as
+// two and no single-tap action (e.g. "tap once to confirm crossing") ever fires.
+const SYNTHETIC_CLICK_SUPPRESS_MS = 700;
 let tapCount = 0;
 let tapTimer = null;
+let lastTouchAt = 0;
 
 document.addEventListener('touchstart', handleScreenTap, { passive: true });
 document.addEventListener('click', handleScreenTap);
@@ -795,6 +805,15 @@ function handleScreenTap(e) {
     if (e.target.closest('.splash-settings-link')) return;
     if (e.target.closest('.back-button')) return;
     if (e.target.closest('.settings-link')) return;
+
+    // De-dupe the touch/click pair: remember when a real touch happened, and
+    // drop any click that trails it within the suppress window. A click with no
+    // recent touch (laptop/desktop) still counts normally.
+    if (e.type === 'touchstart') {
+        lastTouchAt = Date.now();
+    } else if (Date.now() - lastTouchAt < SYNTHETIC_CLICK_SUPPRESS_MS) {
+        return;  // synthetic click following a real touch -- already counted
+    }
 
     tapCount++;
     if (navigator.vibrate) navigator.vibrate(20);
@@ -807,91 +826,18 @@ function handleScreenTap(e) {
 }
 
 // ============================================================
-// Double-confirmation safety layer
+// Gesture -> intent
 // ============================================================
-// Every CONFIRM_YES / CONFIRM_NO decision (choosing a crossing, confirming
-// it's safe to cross, cycling to a different crossing) now requires TWO
-// taps to actually commit. The first tap is echoed back out loud so the
-// user can hear what was detected; only a FOLLOW-UP single tap actually
-// executes it. This exists specifically to catch gesture misdetection --
-// a double-tap misread as a triple-tap, or vice versa -- before it can
-// silently commit to the wrong crossing decision. Given how serious a
-// wrong crossing choice could be, the extra tap is worth it every time.
-let pendingConfirmation = null;
-let pendingConfirmationTimerId = null;
-const PENDING_CONFIRMATION_TIMEOUT_MS = 5000;
-
-const CONFIRMATION_ECHO_MESSAGES = {
-    CONFIRM_TARGET: {
-        CONFIRM_YES: 'You selected: yes, this is my crossing. Tap once more to confirm.',
-        CONFIRM_NO:  'You selected: no, try a different crossing. Tap once more to confirm.'
-    },
-    CONFIRM_CROSSING: {
-        CONFIRM_YES: 'You selected: yes, I will cross now. Tap once more to confirm.',
-        CONFIRM_NO:  'You selected: no, keep waiting. Tap once more to confirm.'
-    },
-    CONFIRM_ARRIVAL: {
-        CONFIRM_YES: 'You selected: yes, I have crossed safely. Tap once more to confirm.'
-    },
-    CHOOSE_POST: {
-        CHOOSE_LEFT:  'You selected: the post on your left. Tap once more to confirm.',
-        CHOOSE_RIGHT: 'You selected: the post on your right. Tap once more to confirm.'
-    }
-};
-
-function armPendingConfirmation(intent) {
-    pendingConfirmation = { intent, originState: currentState };
-    const echo = (CONFIRMATION_ECHO_MESSAGES[currentState] || {})[intent] ||
-        'Tap once more to confirm your selection.';
-    speak(echo);
-
-    if (pendingConfirmationTimerId) clearTimeout(pendingConfirmationTimerId);
-    pendingConfirmationTimerId = setTimeout(() => {
-        if (pendingConfirmation) {
-            pendingConfirmation = null;
-            speak('No confirmation received. Please make your selection again.');
-        }
-    }, PENDING_CONFIRMATION_TIMEOUT_MS);
-}
-
-function resolvePendingConfirmation(gesture) {
-    const confirmed = pendingConfirmation;
-    pendingConfirmation = null;
-    if (pendingConfirmationTimerId) {
-        clearTimeout(pendingConfirmationTimerId);
-        pendingConfirmationTimerId = null;
-    }
-
-    if (gesture !== 'single_tap') {
-        speak('Cancelled. Please make your selection again.');
-        return;
-    }
-
-    // Fail-safe: if the state changed while the confirmation was pending
-    // (e.g. glasses disconnected, or the light changed underneath the
-    // user), the original decision no longer applies -- discard it rather
-    // than executing a now-stale intent against a different situation.
-    if (currentState !== confirmed.originState) {
-        debugLog('State changed during pending confirmation -- discarding stale intent');
-        return;
-    }
-
-    debugLog('Confirmation acknowledged -> ' + confirmed.intent);
-    handleIntent(confirmed.intent);
-}
+// The double-confirmation "tap once more to confirm" echo layer was removed
+// along with the crossing-selection states. Every gesture is now a single tap
+// that commits directly. The only remaining tap gates are the two safety
+// confirmations -- CONFIRM_CROSSING (cross on the green man) and
+// CONFIRM_ARRIVAL (you have crossed) -- and each acts on the first tap.
 
 function classifyGesture(count) {
     const gestureMap = { 1: 'single_tap', 2: 'double_tap', 3: 'triple_tap' };
     const gesture = gestureMap[Math.min(count, 3)];
     if (!gesture) return;
-
-    // If a confirmation is currently pending, THIS tap decides it --
-    // single tap confirms, anything else cancels. Normal gesture rules
-    // are bypassed entirely while a confirmation is pending.
-    if (pendingConfirmation) {
-        resolvePendingConfirmation(gesture);
-        return;
-    }
 
     const rules = GESTURE_RULES[currentState] || {};
     const intent = rules[gesture];
@@ -920,15 +866,11 @@ function classifyGesture(count) {
             case STATES.CONFIRM_ARRIVAL:
                 speak('If you feel the tactile ground indicators, tap once to confirm you have crossed safely.');
                 break;
+            case STATES.CONFIRM_CROSSING:
+                speak('Green man. Tap once to confirm you are crossing now.');
+                break;
             case STATES.READY:
                 speak('Tap anywhere once to start scanning for a crossing.');
-                break;
-            case STATES.CONFIRM_TARGET:
-            case STATES.CONFIRM_CROSSING:
-                speak('Double tap anywhere to confirm yes, or triple tap to try again.');
-                break;
-            case STATES.CHOOSE_POST:
-                speak('Double tap for the post on your left, or triple tap for the post on your right.');
                 break;
             default:
                 announceState(currentState);
@@ -937,17 +879,6 @@ function classifyGesture(count) {
     }
 
     debugLog('Gesture: ' + gesture + ' → ' + intent);
-
-    // CONFIRM_YES / CONFIRM_NO are the safety-critical decisions (choosing
-    // a crossing, confirming it's safe to cross, cycling to another
-    // crossing) -- require a follow-up tap before actually committing,
-    // instead of acting on the very first tap alone.
-    if (intent === 'CONFIRM_YES' || intent === 'CONFIRM_NO' ||
-        intent === 'CHOOSE_LEFT' || intent === 'CHOOSE_RIGHT') {
-        armPendingConfirmation(intent);
-        return;
-    }
-
     handleIntent(intent);
 }
 
@@ -958,13 +889,15 @@ function handleIntent(intent) {
             resolveJunction();
             break;
         case 'CONFIRM_YES':
-            if (currentState === STATES.CONFIRM_TARGET) {
-                navigatingStartHeading = currentHeading;
-                transitionTo(STATES.NAVIGATING, 'Confirmed. Follow the haptic feedback.');
-            } else if (currentState === STATES.CONFIRM_CROSSING) {
+            if (currentState === STATES.CONFIRM_CROSSING) {
                 crossingStartHeading = currentHeading;
                 crossingStartLocation = currentLocation;  // may be null if no GPS fix yet -- handled below
                 transitionTo(STATES.CROSSING, 'Cross now. Walk straight ahead.');
+
+                // Steady directional guidance: a near-continuous buzz on the
+                // side(s) matching crossingDir (both = straight ahead). See
+                // crossingHapticTick().
+                startCrossingHaptics();
 
                 lastCrossingDistance = 0;
                 lastCrossingProgressAt = Date.now();
@@ -992,27 +925,6 @@ function handleIntent(intent) {
                 completeCrossing();
             }
             break;
-        case 'CONFIRM_NO':
-            if (currentState === STATES.CONFIRM_TARGET) {
-                tryNextCrossing();
-            } else if (currentState === STATES.CONFIRM_CROSSING) {
-                transitionTo(STATES.WAITING, 'Understood. Continuing to wait for green man.');
-            }
-            break;
-        case 'CHOOSE_LEFT':
-        case 'CHOOSE_RIGHT':
-            if (currentState === STATES.CHOOSE_POST) {
-                const chosenSide = intent === 'CHOOSE_LEFT' ? 'left' : 'right';
-                const message = `Heading toward the post on your ${chosenSide}. ` +
-                    'Double tap to confirm this is your crossing, triple tap to keep scanning.';
-                transitionTo(STATES.TARGET_DETECTED);
-                setTimeout(() => {
-                    if (currentState === STATES.TARGET_DETECTED) {
-                        transitionTo(STATES.CONFIRM_TARGET, message);
-                    }
-                }, 1500);
-            }
-            break;
         case 'RESET':
             transitionTo(STATES.READY, 'Ready. Tap once to scan again.');
             break;
@@ -1028,13 +940,10 @@ const UI_CONFIG = {
     READY:            { icon: '▶', label: 'Tap to start', cls: '', hint: '1 tap to start', msg: 'Glasses connected. Tap to scan.' },
     SCANNING:         { icon: '🔍', label: 'Scanning...', cls: 'state-confirm', hint: '', msg: 'Looking for a crossing.' },
     RESOLVING:        { icon: '📍', label: 'Locating...', cls: 'state-confirm', hint: '', msg: 'Finding nearby crossings.' },
-    TARGET_DETECTED:  { icon: '🚦', label: 'Found!', cls: 'state-success', hint: '', msg: 'Traffic light found.' },
-    CONFIRM_TARGET:   { icon: '?', label: 'Confirm', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = No', msg: 'Is this the right crossing?' },
-    CHOOSE_POST:      { icon: '↔', label: 'Choose post', cls: 'state-confirm', hint: '2 taps = Left  •  3 taps = Right', msg: 'Which traffic light post?' },
     NAVIGATING:       { icon: '→', label: 'Guiding...', cls: 'state-confirm', hint: '', msg: 'Follow haptic feedback.' },
     REACHED:          { icon: '✓', label: 'Arrived', cls: 'state-success', hint: '', msg: 'You have arrived.' },
     WAITING:          { icon: '🔴', label: 'Red man', cls: 'state-danger', hint: '', msg: 'Please wait.' },
-    CONFIRM_CROSSING: { icon: '🟢', label: 'Cross now?', cls: 'state-confirm', hint: '2 taps = Yes  •  3 taps = Wait', msg: 'Green man. Ready to cross?' },
+    CONFIRM_CROSSING: { icon: '🟢', label: 'Cross now?', cls: 'state-confirm', hint: '1 tap to cross', msg: 'Green man. Tap to cross.' },
     CROSSING:         { icon: '🚶', label: 'Crossing', cls: 'state-success', hint: '', msg: 'Cross now.' },
     CONFIRM_ARRIVAL:  { icon: '?', label: 'Confirm arrival', cls: 'state-confirm', hint: '1 tap = confirm', msg: 'Feel the tactile indicators? Tap to confirm.' },
     COMPLETED:        { icon: '✓', label: 'Tap to reset', cls: 'state-success', hint: '1 tap to scan again', msg: 'Crossing complete.' },
@@ -1083,13 +992,10 @@ function speak(text, interrupt) {
 const STATE_SPEECH = {
     READY:            'Ready. Tap anywhere once to start scanning for a crossing.',
     RESOLVING:        'Identifying nearby crossings. Please wait.',
-    TARGET_DETECTED:  'Traffic light found.',
-    CONFIRM_TARGET:   'Is this the right crossing? Double tap for yes, triple tap to try again.',
-    CHOOSE_POST:      'Two traffic light posts detected. Double tap for the left post, triple tap for the right post.',
-    NAVIGATING:       'Confirmed. Follow the haptic feedback toward the crossing.',
+    NAVIGATING:       'Follow the haptic feedback toward the crossing.',
     REACHED:          'You have reached the crossing.',
     WAITING:          'Checking the signal…',
-    CONFIRM_CROSSING: 'Green man. You may cross. Double tap to confirm.',
+    CONFIRM_CROSSING: 'Green man. You may cross. Tap once to confirm you are crossing.',
     CROSSING:         'Cross now. Walk straight ahead.',
     CONFIRM_ARRIVAL:  'If you feel the tactile ground indicators, tap once to confirm you have crossed safely.',
     COMPLETED:        'Crossing complete. Well done. Tap once to scan again.',

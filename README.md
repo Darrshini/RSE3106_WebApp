@@ -1,6 +1,14 @@
 # NavAssist Web App
 Assistive navigation web app for visually impaired users — RSE3106 James Dyson Award Submission
 
+> **Branch note — `test/pure-crossing`:** this branch is the full app (`index.html` runs
+> `app.js` + `ai.js`, same as `main`), with the crossing-**selection** confirmations removed:
+> it no longer asks the user to double/triple-tap to pick a crossing or a traffic-light post —
+> it identifies the crossing and heads straight for it. The two safety gates are kept, each as a
+> single confirming tap: **CONFIRM_CROSSING** (tap to confirm you are crossing on the green man)
+> and **CONFIRM_ARRIVAL** (tap to confirm you felt the tactile indicators). See `HAPTICS.md` for
+> the state-by-state haptic flow.
+
 The instructions below are to set up the app locally on your PC or laptop if you want to.
 
 I have hosted the webapp on an AWS instance, you can access it through this link: [Web app prototype](https://rse3106.duckdns.org/)
