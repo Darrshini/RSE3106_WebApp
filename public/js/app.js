@@ -52,7 +52,22 @@ const STATES = {
 let currentState = STATES.IDLE;
 let armedGestures = [];
 
+// Crossing lock. Set true the moment the user starts physically crossing, and
+// cleared only when the crossing genuinely finishes (COMPLETED) or the glasses
+// drop (LOST_CONNECTION). While it is set, transitionTo() refuses to leave
+// CROSSING for anything else -- a GPS glitch, a false vision-arrival, a stray
+// tap, or a re-detected light can't yank a blind user out of "keep walking"
+// mode partway across the road. The only things that still happen while locked
+// are the crossing cues themselves (straight/left/right guidance, the red-light
+// hurry) -- those don't change state, so the guard never touches them.
+let crossingLocked = false;
+
 function transitionTo(newState, message) {
+    if (crossingLocked && currentState === STATES.CROSSING &&
+        newState !== STATES.COMPLETED && newState !== STATES.LOST_CONNECTION) {
+        debugLog('Crossing locked -- ignoring transition to ' + newState);
+        return;
+    }
     debugLog('State: ' + currentState + ' → ' + newState);
     currentState = newState;
     updateUI(newState, message);
@@ -153,6 +168,7 @@ function handleConnectionEvent(payload) {
             crossingFallbackTimerId = null;
         }
         stopCrossingHaptics();
+        crossingLocked = false;  // glasses lost -> release the crossing lock
         if (currentState !== STATES.IDLE) {
             speak('Glasses disconnected. Please check the connection.', true);
             transitionTo(STATES.LOST_CONNECTION);
@@ -288,6 +304,10 @@ const CROSSING_DISTANCE_THRESHOLD_M = 8;
 const CROSSING_PROGRESS_MIN_DELTA_M = 1;
 const CROSSING_STALL_WARNING_MS = 8000;
 const CROSSING_ABSOLUTE_CEILING_MS = 90000;
+// A lost/reacquired GPS fix jumps the position wildly. Ignore any fix worse
+// than this (metres) while crossing, so a glitch can't trip the distance check
+// and end the crossing mid-road. Vision arrival / stall / ceiling still finish.
+const CROSSING_GPS_MAX_ACCURACY_M = 20;
 
 function distanceMeters(lat1, lng1, lat2, lng2) {
     const R = 6371000;
@@ -310,6 +330,7 @@ function checkCrossingStall() {
 
 function completeCrossing() {
     if (currentState !== STATES.CROSSING) return;
+    crossingLocked = false;  // genuine finish -> release the crossing lock
     crossingStartHeading = null;
     crossingStartLocation = null;
     stopCrossingHaptics();  // leaving CROSSING -> stop the steady guidance pulse
@@ -347,20 +368,30 @@ function startGpsTracking() {
             }
 
             if (currentState === STATES.CROSSING && crossingStartLocation) {
-                const moved = distanceMeters(
-                    crossingStartLocation.latitude, crossingStartLocation.longitude,
-                    currentLocation.latitude, currentLocation.longitude
-                );
-                debugLog('Crossing distance moved: ' + moved.toFixed(1) + 'm');
+                // Trust GPS during a crossing ONLY when the fix is accurate. A
+                // lost/reacquired signal reports a large accuracy radius and a
+                // jumped position; feeding that to the distance check used to
+                // end the crossing mid-road. Skip such fixes entirely -- the
+                // vision arrival, stall check and absolute ceiling still finish.
+                if (currentLocation.accuracyMeters > CROSSING_GPS_MAX_ACCURACY_M) {
+                    debugLog('Crossing: ignoring low-accuracy GPS fix (±' +
+                        currentLocation.accuracyMeters.toFixed(0) + 'm)');
+                } else {
+                    const moved = distanceMeters(
+                        crossingStartLocation.latitude, crossingStartLocation.longitude,
+                        currentLocation.latitude, currentLocation.longitude
+                    );
+                    debugLog('Crossing distance moved: ' + moved.toFixed(1) + 'm');
 
-                if (moved - lastCrossingDistance >= CROSSING_PROGRESS_MIN_DELTA_M) {
-                    lastCrossingDistance = moved;
-                    lastCrossingProgressAt = Date.now();
-                    crossingStallWarned = false;
-                }
+                    if (moved - lastCrossingDistance >= CROSSING_PROGRESS_MIN_DELTA_M) {
+                        lastCrossingDistance = moved;
+                        lastCrossingProgressAt = Date.now();
+                        crossingStallWarned = false;
+                    }
 
-                if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
-                    completeCrossing();
+                    if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
+                        completeCrossing();
+                    }
                 }
             }
         },
@@ -585,6 +616,10 @@ window.navassist.onGreenCross = function() {
         // Steady directional guidance: a 0.5s pulse every 2s on the side(s)
         // matching crossingDir (both = straight ahead). See crossingHapticTick().
         startCrossingHaptics();
+
+        // Lock the app into crossing mode: from here nothing can pull the state
+        // out of CROSSING except a genuine finish or losing the glasses.
+        crossingLocked = true;
 
         lastCrossingDistance = 0;
         lastCrossingProgressAt = Date.now();
