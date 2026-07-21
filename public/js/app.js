@@ -152,6 +152,7 @@ function handleConnectionEvent(payload) {
             clearTimeout(crossingFallbackTimerId);
             crossingFallbackTimerId = null;
         }
+        stopCrossingHaptics();
         if (currentState !== STATES.IDLE) {
             speak('Glasses disconnected. Please check the connection.', true);
             transitionTo(STATES.LOST_CONNECTION);
@@ -183,9 +184,20 @@ let lastTurnWarningAt = 0;
 const TURN_WARNING_COOLDOWN_MS = 5000;
 
 let crossingStartHeading = null;
-let lastCrossingHapticAt = 0;
 const CROSSING_DRIFT_THRESHOLD_DEG = 20;
-const CROSSING_HAPTIC_COOLDOWN_MS = 1500;
+
+// While CROSSING, guidance is a STEADY cadence rather than one buzz per frame:
+// a short pulse every CROSSING_HAPTIC_INTERVAL_MS on the side(s) matching the
+// current guidance direction -- both sides = go straight, one side = veer that
+// way. crossingDir is refreshed by the vision corridor (onCorridorDirection),
+// and, when the corridor isn't visible, by compass drift (checkHeadingDrift).
+// The buzz itself is emitted by crossingHapticTick() on the interval below.
+const CROSSING_HAPTIC_INTERVAL_MS = 2000;   // re-fire the buzz every 2 seconds
+const CROSSING_HAPTIC_DURATION_MS = 500;    // each buzz lasts 0.5 seconds
+const CROSSING_HAPTIC_INTENSITY   = 0.7;
+const CROSSING_CORRIDOR_STALE_MS  = 1500;   // vision stays authoritative this long after each sighting
+let crossingDir = 'CENTRE';
+let lastCorridorAt = 0;
 
 function angleDiffDeg(a, b) {
     let diff = a - b;
@@ -230,14 +242,18 @@ function checkHeadingDrift() {
         }
     }
 
-    if (currentState === STATES.CROSSING && crossingStartHeading !== null) {
+    // Compass fallback for crossing guidance: only steer by heading drift when
+    // the vision corridor is stale (not seen recently) -- the dotted-line
+    // corridor is the primary guide when visible. This just updates crossingDir;
+    // the buzz is emitted on the steady cadence by crossingHapticTick().
+    // Positive drift = turned right -> steer left to correct, and vice versa.
+    if (currentState === STATES.CROSSING && crossingStartHeading !== null &&
+        Date.now() - lastCorridorAt > CROSSING_CORRIDOR_STALE_MS) {
         const drift = angleDiffDeg(currentHeading, crossingStartHeading);
-        const now = Date.now();
-        if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG &&
-            now - lastCrossingHapticAt > CROSSING_HAPTIC_COOLDOWN_MS) {
-            lastCrossingHapticAt = now;
-            if (drift > 0) sendHaptic('left', 'pulse', 0.6, 250);
-            else            sendHaptic('right', 'pulse', 0.6, 250);
+        if (Math.abs(drift) > CROSSING_DRIFT_THRESHOLD_DEG) {
+            crossingDir = drift > 0 ? 'LEFT' : 'RIGHT';
+        } else {
+            crossingDir = 'CENTRE';  // back on line -> go straight (both sides)
         }
     }
 }
@@ -264,6 +280,7 @@ let currentLocation = null;
 let crossingStartLocation = null;
 let crossingFallbackTimerId = null;
 let crossingStallCheckId = null;
+let crossingHapticTimerId = null;
 let lastCrossingDistance = 0;
 let lastCrossingProgressAt = 0;
 let crossingStallWarned = false;
@@ -295,6 +312,7 @@ function completeCrossing() {
     if (currentState !== STATES.CROSSING) return;
     crossingStartHeading = null;
     crossingStartLocation = null;
+    stopCrossingHaptics();  // leaving CROSSING -> stop the steady guidance pulse
     if (crossingStallCheckId) {
         clearInterval(crossingStallCheckId);
         crossingStallCheckId = null;
@@ -498,6 +516,35 @@ function sendHaptic(motor, pattern, intensity, durationMs) {
     debugLog('Haptic: ' + motor);
 }
 
+// The steady crossing-guidance pulse. Fires on CROSSING_HAPTIC_INTERVAL_MS and
+// buzzes for CROSSING_HAPTIC_DURATION_MS on the side(s) matching crossingDir:
+//   CENTRE (go straight) -> BOTH motors    LEFT -> left motor    RIGHT -> right
+// crossingDir is kept current by onCorridorDirection (vision) and, as a
+// fallback, checkHeadingDrift (compass). The cadence is fixed here so guidance
+// is one clean pulse every couple of seconds instead of one per camera frame.
+function crossingHapticTick() {
+    if (currentState !== STATES.CROSSING) { stopCrossingHaptics(); return; }
+    const motor = crossingDir === 'LEFT' ? 'left'
+                : crossingDir === 'RIGHT' ? 'right'
+                : 'both';
+    sendHaptic(motor, 'pulse', CROSSING_HAPTIC_INTENSITY, CROSSING_HAPTIC_DURATION_MS);
+}
+
+function startCrossingHaptics() {
+    stopCrossingHaptics();
+    crossingDir = 'CENTRE';   // start by guiding straight ahead (both sides)
+    lastCorridorAt = 0;       // no corridor seen yet -> compass fallback allowed immediately
+    crossingHapticTick();     // buzz once right away, then every interval
+    crossingHapticTimerId = setInterval(crossingHapticTick, CROSSING_HAPTIC_INTERVAL_MS);
+}
+
+function stopCrossingHaptics() {
+    if (crossingHapticTimerId) {
+        clearInterval(crossingHapticTimerId);
+        crossingHapticTimerId = null;
+    }
+}
+
 // --- Callbacks for ai.js (all vision-driven, no tap confirmations) ---
 
 window.navassist.onTrafficLightVisible = function(confidence, direction) {
@@ -535,6 +582,10 @@ window.navassist.onGreenCross = function() {
         transitionTo(STATES.CROSSING, 'Green man. You may cross now.');
         sendHaptic('both', 'pulse', 1.0, 800);
 
+        // Steady directional guidance: a 0.5s pulse every 2s on the side(s)
+        // matching crossingDir (both = straight ahead). See crossingHapticTick().
+        startCrossingHaptics();
+
         lastCrossingDistance = 0;
         lastCrossingProgressAt = Date.now();
         crossingStallWarned = false;
@@ -561,14 +612,16 @@ window.navassist.onGreenDirection = function(direction) {
     else                            sendHaptic('both',  'pulse', 0.3, 200);
 };
 
+// Called by ai.js (per frame, while CROSSING) with the dotted-line corridor
+// direction. This no longer buzzes directly -- it just records the latest
+// guidance direction and when it was seen; the pulse is emitted on the steady
+// 2-second cadence by crossingHapticTick(). Vision stays authoritative for
+// CROSSING_CORRIDOR_STALE_MS after each sighting; only once it goes stale does
+// the compass-drift fallback in checkHeadingDrift() get to set crossingDir.
 window.navassist.onCorridorDirection = function(direction) {
     if (currentState !== STATES.CROSSING) return;
-    const now = Date.now();
-    if (now - lastCrossingHapticAt < CROSSING_HAPTIC_COOLDOWN_MS) return;
-    lastCrossingHapticAt = now;
-
-    if (direction === 'LEFT')       sendHaptic('left',  'pulse', 0.6, 250);
-    else if (direction === 'RIGHT') sendHaptic('right', 'pulse', 0.6, 250);
+    crossingDir = direction || 'CENTRE';
+    lastCorridorAt = Date.now();
 };
 
 window.navassist.onVisionArrivalSignal = function() {
@@ -580,8 +633,14 @@ window.navassist.onVisionArrivalSignal = function() {
 // ============================================================
 
 const TAP_WINDOW_MS = 400;
+// A real touch on a phone fires touchstart AND, a moment later, a synthesized
+// click. We listen for both (so laptops, which only fire click, still work),
+// but must count each physical tap ONCE -- otherwise a single tap registers as
+// two and no single-tap action (start scan / reset) ever fires.
+const SYNTHETIC_CLICK_SUPPRESS_MS = 700;
 let tapCount = 0;
 let tapTimer = null;
+let lastTouchAt = 0;
 
 document.addEventListener('touchstart', handleScreenTap, { passive: true });
 document.addEventListener('click', handleScreenTap);
@@ -590,6 +649,15 @@ function handleScreenTap(e) {
     if (e.target.closest('.splash-settings-link')) return;
     if (e.target.closest('.back-button')) return;
     if (e.target.closest('.settings-link')) return;
+
+    // De-dupe the touch/click pair: remember when a real touch happened, and
+    // drop any click that trails it within the suppress window. A click with no
+    // recent touch (laptop/desktop) still counts normally.
+    if (e.type === 'touchstart') {
+        lastTouchAt = Date.now();
+    } else if (Date.now() - lastTouchAt < SYNTHETIC_CLICK_SUPPRESS_MS) {
+        return;  // synthetic click following a real touch -- already counted
+    }
 
     tapCount++;
     if (navigator.vibrate) navigator.vibrate(20);
