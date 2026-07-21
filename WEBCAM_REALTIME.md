@@ -32,6 +32,10 @@ frame size, same JPEG artefacts). `webcam.html` is the fallback when the Pi isn'
 
 This trips people up, so it's worth stating plainly.
 
+> **Note:** the **real app (`index.html`) now uses only the server model** (`crossing_seg.onnx`)
+> and runs no browser inference — see `PI_REALTIME.md`. The browser `pedestrian.onnx` below is
+> used only by the **dev/debug pages**: `webcam.html` (this page), `pi.html`, and `model_test.html`.
+
 **1. `public/models/pedestrian.onnx`** — classes `['red', 'green', 'traffic-light']`.
 Runs **in the browser**, via `onnxruntime-web`, inside a Web Worker
 (`public/js/inference.worker.js`) so inference never blocks the video or the UI. Tries WebGPU

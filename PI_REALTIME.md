@@ -9,30 +9,32 @@ Hardware: **Raspberry Pi Zero 2W + Camera Module v3**, worn on the glasses, moun
 
 ## The one-paragraph version
 
-The Pi captures 640×480 JPEGs with its hardware encoder and pushes the raw bytes over a
-WebSocket. The Node server relays those bytes untouched to every browser watching, and — on a
-worker thread, on the same frame it just relayed — runs the crossing segmentation model and
-pushes the result down the same socket. The browser draws the frame, runs the pedestrian model
-on it locally, and makes every actual decision. Nobody re-uploads a frame to anybody.
+The Pi captures JPEGs with its hardware encoder and pushes the raw bytes over a WebSocket. The
+Node server relays those bytes untouched to every browser watching, and — on a worker thread, on
+the same frame it just relayed — runs the crossing segmentation model and pushes the result down
+the same socket. The browser (`index.html`) just draws the frame and acts on the result; it runs
+**no model of its own**. Nobody re-uploads a frame to anybody.
 
 ```
 Pi Zero 2W                      Node server                     Browser (index.html)
 ──────────                      ───────────                     ────────────────────
 picamera2                                                       app.js  — socket, GPS, FSM
   └ hardware MJPEG              /pi  ──┬── relay bytes ──►      ai.js   — decode, rotate, draw
-      └ raw JPEG bytes ─────────►      │                          └ inference.worker.js
-        (binary WS frame)              └── crossing_worker.js         └ pedestrian.onnx
-                                            └ crossing_seg.onnx           (WebGPU / WASM)
+      └ raw JPEG bytes ─────────►      │                          (no browser inference)
+        (binary WS frame)              └── crossing_worker.js
+                                            └ crossing_seg.onnx
         ◄──────── haptic/command ────────┘        │
                                                   └── crossing/result ──► /live
 ```
 
 ## Which model runs where, and why not on the Pi
 
-| Model | Classes | Where | How |
+The real app (`index.html`) uses a **single model, on the Node server** — the browser runs none:
+
+| Model | Classes | Where | Used by |
 |---|---|---|---|
-| `pedestrian.onnx` | red, green, traffic-light | **Browser** | onnxruntime-web in `js/inference.worker.js`, WebGPU → WASM fallback. Self-hosted runtime under `public/vendor/onnxruntime/` (not a CDN, so it works with no internet). |
-| `crossing_seg.onnx` | dotted line, pedestrian light | **Node server** | onnxruntime-node in `crossing_worker.js`, a worker thread. |
+| `crossing_seg.onnx` | dotted line, pedestrian light | **Node server** — onnxruntime-node in `crossing_worker.js`, a worker thread | **`index.html` (the real app)**, plus `pi.html` / `webcam.html`. The server derives the light state (red / green / flashing) and the crossing corridor from it and pushes both as `crossing/result`. |
+| `pedestrian.onnx` | red, green, traffic-light | **Browser** — onnxruntime-web in `js/inference.worker.js`, WebGPU → WASM, self-hosted under `public/vendor/onnxruntime/` (no CDN, works offline) | **Dev/debug pages only** (`pi.html`, `webcam.html`, `model_test.html`). `index.html` no longer runs it. |
 
 **Neither runs on the Pi, and neither should.** A Zero 2W is 4× Cortex-A53 @1GHz with 512 MB of
 RAM. A YOLO11 pass on it takes seconds. Moving inference there wouldn't speed the system up, it
@@ -187,8 +189,8 @@ dead ESP32 path; delete it whenever you like.
 | `server.js` | `/pi` + `/live` relay, backpressure, `PI_ROTATE`, pumps frames into the crossing worker. |
 | `crossing_worker.js` | Worker thread. Keeps `crossing_seg.onnx` off the event loop. |
 | `crossing_infer.js` | The actual seg model + `sharp` preprocessing + mask decode. |
-| `public/js/app.js` | `/live` socket, binary vs JSON split, GPS, state machine, haptics. |
-| `public/js/ai.js` | Decode → rotate → draw → `pedestrian.onnx`; folds `crossing/result` into the FSM. |
+| `public/js/app.js` | `/live` socket, binary vs JSON split, GPS, the vision-driven state machine (no tap confirmations; single-tap start/reset only), speech, and haptics — including the steady crossing-guidance cadence and the crossing lock. |
+| `public/js/ai.js` | Decode → rotate → draw the frame + the `crossing/result` overlay, and fold that result into the state machine (light state → cues, corridor → guidance). Runs **no browser model**. |
 | `public/js/pi.js` | `pi.html`'s test bench. Same feed, same models, plus HUD and confidence slider. |
 
 ---

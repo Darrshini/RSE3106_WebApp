@@ -30,18 +30,32 @@ Raspberry Pi Zero 2W + Camera Module v3 (glasses hardware)
 ```
 
 **The Pi is a camera, not a brain.** It captures JPEG frames and ships the bytes; that is all
-it does. The two AI models run in two *other* places, and neither runs on the Pi:
+it does.
 
-| Model | Classes | Runs |
-|---|---|---|
-| `pedestrian.onnx` | `red`, `green`, `traffic-light` | **In the browser**, via onnxruntime-web in a Web Worker (`js/inference.worker.js`). WebGPU where available, else WASM. |
-| `crossing_seg.onnx` | `dotted line`, `pedestrian light` | **On the Node server**, via onnxruntime-node on a worker thread (`crossing_worker.js`). |
+**The real app (`index.html`) now runs on a single model, on the Node server** — not on the Pi,
+and not in the browser. The server runs `crossing_seg.onnx` on each frame and pushes the result to
+the browser as JSON: the pedestrian-light state (red / green / flashing, derived on the server from
+the light region) and the dotted-line crossing corridor. `ai.js` makes every decision from that
+result and runs **no inference of its own**.
+
+| Model | Classes | Runs | Used by |
+|---|---|---|---|
+| `crossing_seg.onnx` | `dotted line`, `pedestrian light` | **Node server**, onnxruntime-node on a worker thread (`crossing_worker.js`) | **`index.html` (the real app)**, plus `pi.html` / `webcam.html` |
+| `pedestrian.onnx` | `red`, `green`, `traffic-light` | **Browser**, onnxruntime-web in a Web Worker (`js/inference.worker.js`), WebGPU→WASM | **Dev/debug pages only** — `pi.html`, `webcam.html`, `model_test.html`. The real app no longer uses it. |
 
 A Zero 2W is 4× Cortex-A53 @1GHz with 512 MB of RAM — a YOLO11 pass on it takes *seconds*,
 not milliseconds. Moving inference onto the Pi wouldn't make the system faster, it would stop
-it working at all. So the Pi encodes and sends, the server segments, and the browser detects.
-All the *decisions* (state machine, GPS/crossing logic, confirmations, speech) live in the
-browser, in `app.js`.
+it working at all. So the Pi encodes and sends, and the server segments.
+All the *decisions* (state machine, GPS/crossing logic, speech, haptics) live in the browser, in
+`app.js`.
+
+**The flow is vision-driven.** There are no double/triple-tap confirmations to memorise: you tap
+once to start scanning, and from there the app advances itself — it identifies the crossing and
+guides you toward it, reads the signal, and starts you across on the green man, all automatically.
+The only other tap is a single tap to reset once you've crossed. While you're physically crossing,
+the app is **locked into crossing mode** (a GPS glitch or a stray tap can't interrupt the guidance
+mid-road); the haptics settle into a steady pulse — **both motors = go straight, one side = veer
+that way** — until you reach the other side.
 
 ### Hardware history
 
@@ -133,7 +147,7 @@ server, and the web app's status bar should show "Glasses connected."
 
 | Page | What it's for |
 |---|---|
-| `index.html` | **The real app.** Pi feed + both models + GPS + state machine + speech. |
+| `index.html` | **The real app.** Pi feed + the server `crossing_seg.onnx` result + GPS + vision-driven state machine + speech + haptics. Runs no model in the browser. |
 | `pi.html` | Pi camera test bench — the same feed and both models, with an FPS/latency HUD and a live confidence slider, but no GPS or state machine. **Use this to debug the vision stack.** |
 | `webcam.html` | Same two models against a **laptop webcam**, no Pi involved. See `WEBCAM_REALTIME.md`. |
 | `test.html` | Crossing model against an **uploaded video file**. |

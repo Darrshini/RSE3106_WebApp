@@ -4,7 +4,7 @@
 What is NOT yet proven is the full networked path through `navassist_pi_camera.py` — server →
 `/pi` → this script → motor.** Read "How to test" below and start there.
 
-Updated 2026-07-15. Hardware: two ERM vibration motors. The pin mapping lives in **`haptic.py`**
+Updated 2026-07-21. Hardware: two ERM vibration motors. The pin mapping lives in **`haptic.py`**
 (`HapticController`), not in this file.
 
 ---
@@ -123,17 +123,27 @@ AI triggers a buzz, and this is the thing that already wasted an evening once:
 Both buttons are the only haptic path on that page. A traffic light detected on `pi.html` will
 **never** move a motor on its own. Same for `webcam.html`. That is by design, not a bug.
 
-Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states:
-- `onDirectionDecided` (`app.js:672`) returns immediately unless state is **`NAVIGATING`**
-- `onGreenDirection` (`app.js:717`) buzzes the green-man side only while **`WAITING`**
-- corridor drift-correction (`app.js:756`) requires **`CROSSING`**
-- reaching `NAVIGATING` means: detect a **traffic-light *post*** → **double-tap confirm**
+Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states.
+The flow is **vision-driven** — there are **no double/triple-tap confirmations**; the only taps
+are a single tap to start scanning and a single tap to reset after a crossing:
+- `onDirectionDecided` (`app.js:590`) buzzes toward the traffic-light post only while **`NAVIGATING`**
+- `onGreenDirection` (`app.js:639`) buzzes the green-man side while **`WAITING`** or **`SCANNING`**
+- **Crossing guidance** — while **`CROSSING`**, `crossingHapticTick()` (`app.js:556`) fires a
+  steady **0.5 s pulse every 2 s** on the side(s) matching the corridor direction: **both = go
+  straight**, one side = veer that way. `onCorridorDirection` (`app.js:656`) feeds it the vision
+  direction; compass drift is a fallback when the corridor isn't visible. (Tunables:
+  `CROSSING_HAPTIC_INTERVAL_MS`, `CROSSING_HAPTIC_DURATION_MS`, `CROSSING_HAPTIC_INTENSITY`.)
 
-So opening `index.html`, pointing at a **green man**, and expecting a buzz will not work — you
-sit in `SCANNING`, where no haptic path exists, and a green man isn't even what advances SCANNING
-(a traffic-light *post* is). There are also deliberate cooldowns
-(`CROSSING_HAPTIC_COOLDOWN_MS = 1500`, `GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000`) so it will
-not buzz every frame even when it is working.
+Reaching those states needs **no taps**: a traffic-light *post* advances **SCANNING → NAVIGATING**
+automatically, and a green man advances **WAITING → CROSSING** automatically (`onGreenCross`,
+`app.js:609`). Once crossing starts the app is **locked into `CROSSING`** (`crossingLocked`,
+`app.js:63`) — nothing can pull the state out of it except a genuine finish or losing the glasses,
+so a GPS glitch or a stray tap can't interrupt a wearer mid-road.
+
+So opening `index.html` and pointing at a **green man** *does* buzz toward it (via `onGreenDirection`
+while `SCANNING`/`WAITING`) — but the steady crossing cadence only begins once you're actually
+**`CROSSING`**. The green-direction buzz has its own cooldown
+(`GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000`) so it won't fire every frame.
 
 **Get the transport green on `pi.html` first.** If a button buzzes, any failure on
 `index.html` is state-machine logic, not plumbing — a much smaller haystack.
@@ -234,13 +244,14 @@ breakout, you will eventually take the pin — or the SoC — with them.
 Read `PI_REALTIME.md` first — it's the main camera path and explains why the Pi runs neither
 model. The short version of the model layout, since it confuses everyone:
 
-| Model | Classes | Runs |
-|---|---|---|
-| `pedestrian.onnx` | red, green, traffic-light | **Browser**, onnxruntime-web in a worker |
-| `crossing_seg.onnx` | **dotted line**, pedestrian light | **Node server**, onnxruntime-node on a worker thread |
+| Model | Classes | Runs | Used by |
+|---|---|---|---|
+| `crossing_seg.onnx` | **dotted line**, pedestrian light | **Node server**, onnxruntime-node on a worker thread | **`index.html` (the real app)**, plus `pi.html` / `webcam.html` |
+| `pedestrian.onnx` | red, green, traffic-light | **Browser**, onnxruntime-web in a worker | dev/debug pages only (`pi.html`, `webcam.html`, `model_test.html`) |
 
 Neither runs on the Pi. The dotted-line/crossing model's output is drawn on `pi.html` and
 `webcam.html`, and now also on `index.html` (a draw-only overlay was added — see `ai.js`
-`drawCrossingOverlay`), while on `index.html` it *additionally* feeds the state machine
-(haptic drift correction + light-state read). Motors are driven only from `app.js`
-(`index.html`), never from `pi.js`/`webcam.js`.
+`drawCrossingOverlay`), while on `index.html` it *additionally* drives the state machine — the
+corridor direction feeds the steady crossing-guidance cadence and the light state (red / green /
+flashing) drives the spoken cues. Motors are driven only from `app.js` (`index.html`), never from
+`pi.js`/`webcam.js`.
