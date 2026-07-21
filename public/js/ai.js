@@ -2,34 +2,29 @@
  * NavAssist — ai.js
  * OWNER: Kim Hyeonghu (adapted: Raspberry Pi camera frames instead of laptop webcam)
  *
- * Camera frame ingestion + crossing overlay + FSM callbacks.
+ * Camera frame ingestion + crossing overlay + vision-driven FSM.
  *
- * Uses a SINGLE model: crossing_seg.onnx, which runs on the NODE SERVER
- * (via crossing_worker.js / crossing_infer.js). It detects 'dotted line'
- * and 'pedestrian light' classes with instance segmentation masks, and uses
- * HSV colour analysis on the detected light to determine its state
- * (GREEN / RED / GREENRED / NONE).
+ * Uses a SINGLE model: crossing_seg.onnx, which runs on the NODE SERVER.
+ * Audio logic follows crossing.js (live.html): vision-driven transitions
+ * with NO tap confirmations. The model detects 'dotted line' and
+ * 'pedestrian light' classes, using independent green/red boolean signals
+ * and a RED_HOLD timer to distinguish blink-off from constant red.
  *
  * Flow:
- *   1. app.js calls handleCameraFrame(buf) with the raw JPEG bytes of every
- *      binary frame that arrives on /live.
- *   2. Each frame is decoded (off-thread, via createImageBitmap), rotated
- *      upright, and drawn onto the #camFrame canvas.
- *   3. The server already has the same frame (the Pi sent it there), runs
- *      crossing_seg.onnx on it, and pushes a 'crossing/result' JSON back
- *      down /live. app.js routes it to handleCrossingPerception() here.
- *   4. handleCrossingPerception() draws the overlay on #crossOverlay AND
- *      fires FSM callbacks (window.navassist.*) that drive app.js's state
- *      machine and audio announcements.
+ *   1. app.js calls handleCameraFrame(buf) with raw JPEG bytes from /live.
+ *   2. Frames are decoded, rotated, and drawn onto #camFrame.
+ *   3. The server runs crossing_seg.onnx and pushes 'crossing/result' JSON.
+ *   4. handleCrossingPerception() draws the overlay AND drives state
+ *      transitions directly (no tap confirmations).
  */
 
 // ============================================================
 // Config
 // ============================================================
-const RED_SPEAK_COOLDOWN_MS = 6000;
-
 const END_NO_DASH_FRAMES = 6;
 const END_LIGHT_AREA_FRAC = 0.02;
+const RED_HOLD_MS = 2000;
+const SPEAK_COOLDOWN_MS = 3500;
 
 // ============================================================
 // State
@@ -45,8 +40,15 @@ let rotateDeg = 90;
 let noDashStreak = 0;
 let started = false;
 let modelStatus = 'idle';
-let lastRedSpeakAt = 0;
 let fps = 0, lastFrameTs = 0;
+
+// crossing.js-style temporal state
+let redSince = null;
+let hurried = false;
+let lastCat = 'NONE';
+let lastDirWord = '';
+let lastSpeakAt = 0;
+let lastKnownState = null;
 
 // ============================================================
 // Public entry points
@@ -90,7 +92,7 @@ function startCameraAI() {
 }
 
 // ============================================================
-// Camera frame ingestion — called by app.js for every binary frame on /live
+// Camera frame ingestion
 // ============================================================
 function handleCameraFrame(buf) {
     if (!buf || !buf.byteLength) return;
@@ -143,15 +145,19 @@ function onDecodeSettled() {
 }
 
 // ============================================================
-// Server-side crossing perception — the SINGLE model path
+// Throttled speak (crossing.js-style)
 // ============================================================
-// The server runs crossing_seg.onnx on every Pi frame and pushes
-// 'crossing/result' JSON. This function processes every result:
-//   1. Draws the overlay (dotted-line masks, corridor arrow, light box)
-//   2. Fires the appropriate FSM callbacks for the current app state
-//
-// Handles ALL relevant states (SCANNING, NAVIGATING, WAITING, CROSSING)
-// since this is now the only model driving the state machine.
+function speakThrottled(text, force) {
+    const now = Date.now();
+    if (!force && now - lastSpeakAt < SPEAK_COOLDOWN_MS) return false;
+    lastSpeakAt = now;
+    window.navassist.speak && window.navassist.speak(text);
+    return true;
+}
+
+// ============================================================
+// Server-side crossing perception — vision-driven FSM
+// ============================================================
 function handleCrossingPerception(result) {
     drawCrossingOverlay(result);
 
@@ -159,19 +165,28 @@ function handleCrossingPerception(result) {
     const STATES = window.navassist.STATES;
     if (!state || !STATES) return;
 
+    // Reset temporal state on state transitions
+    if (state !== lastKnownState) {
+        if (state === STATES.WAITING || state === STATES.SCANNING) {
+            redSince = null;
+            hurried = false;
+            lastCat = 'NONE';
+            lastDirWord = '';
+            noDashStreak = 0;
+        }
+        lastKnownState = state;
+    }
+
     const frameW = result.w || 1;
     const frameH = result.h || 1;
 
-    // --- SCANNING: detect the pedestrian light to advance past scanning ---
+    // --- SCANNING: detect the pedestrian light to advance to NAVIGATING ---
     if (state === STATES.SCANNING && result.light) {
         const lightCx = (result.light.box[0] + result.light.box[2]) / 2;
         const lightDir = getDirection(lightCx / frameW);
-        if (lightDir !== 'CENTRE') {
-            window.navassist.speak && window.navassist.speak(
-                'Traffic light post detected to your ' + lightDir.toLowerCase() + '.');
-        }
         window.navassist.onTrafficLightVisible &&
-            window.navassist.onTrafficLightVisible(result.light.conf);
+            window.navassist.onTrafficLightVisible(result.light.conf, lightDir);
+        return;
     }
 
     // --- NAVIGATING: guide toward the pedestrian light, detect arrival ---
@@ -186,39 +201,56 @@ function handleCrossingPerception(result) {
             window.navassist.onDirectionDecided &&
                 window.navassist.onDirectionDecided(direction);
         }
+        return;
     }
 
-    // --- WAITING: light state detection + directional haptic ---
-    if (state === STATES.WAITING && result.light) {
-        const lightCx = (result.light.box[0] + result.light.box[2]) / 2;
-        const lightDir = getDirection(lightCx / frameW);
+    // --- WAITING + CROSSING: crossing.js-style temporal logic ---
+    // Uses independent green/red boolean signals from the server, NOT the
+    // combined .state string. This matches crossing.js's decide() function.
+    const light = result.light;
+    const green = !!(light && light.green);
+    const red = !!(light && light.red);
+    const crossingSeen = !!(result.signals && result.signals.corridorAhead);
+    const cat = green ? (red ? 'GREEN_RED' : 'GREEN_ONLY') : (red ? 'RED_ONLY' : 'NONE');
+    const changed = cat !== lastCat;
+    lastCat = cat;
 
-        if (result.light.state === 'GREEN') {
-            window.navassist.onGreenDetected &&
-                window.navassist.onGreenDetected(lightDir);
-        } else if (result.light.state === 'GREENRED') {
-            window.navassist.onGreenFlashing &&
-                window.navassist.onGreenFlashing(lightDir);
-        } else if (result.light.state === 'RED') {
-            const now = Date.now();
-            if (now - lastRedSpeakAt > RED_SPEAK_COOLDOWN_MS) {
-                lastRedSpeakAt = now;
-                window.navassist.speak &&
-                    window.navassist.speak('Still red. Please continue to wait.');
-            }
+    // Red timer: any green resets it; sustained RED-only for RED_HOLD_MS
+    // means the light has switched to constant red (not just a blink-off).
+    if (green) redSince = null;
+    else if (cat === 'RED_ONLY' && redSince == null) redSince = performance.now();
+    const constantRed = redSince != null && (performance.now() - redSince) >= RED_HOLD_MS;
+
+    if (state === STATES.WAITING) {
+        if (cat === 'GREEN_ONLY' && crossingSeen) {
+            window.navassist.onGreenCross && window.navassist.onGreenCross();
+        } else if (cat === 'GREEN_RED') {
+            if (changed) speakThrottled('Green is flashing, wait for the next green.');
+        } else if (cat === 'RED_ONLY') {
+            if (changed) speakThrottled('Red man. Please wait.');
         }
 
-        if (result.light.state === 'GREEN' || result.light.state === 'GREENRED') {
+        // Directional haptic toward the green man
+        if (light && (cat === 'GREEN_ONLY' || cat === 'GREEN_RED')) {
+            const lightCx = (light.box[0] + light.box[2]) / 2;
+            const lightDir = getDirection(lightCx / frameW);
             window.navassist.onGreenDirection &&
                 window.navassist.onGreenDirection(lightDir);
         }
-    }
-
-    // --- CROSSING: corridor guidance + vision-based arrival signal ---
-    if (state === STATES.CROSSING) {
+    } else if (state === STATES.CROSSING) {
+        // Corridor direction guidance (spoken + haptic)
         if (result.corridor && result.corridor.has) {
             noDashStreak = 0;
             const ang = result.corridor.angleDeg;
+            let dirWord = 'straight ahead';
+            if (ang > -65 && ang <= 0) dirWord = 'veer right';
+            else if (ang < -115 && ang >= -180) dirWord = 'veer left';
+
+            if (dirWord !== lastDirWord) {
+                if (speakThrottled(dirWord, lastDirWord === '')) lastDirWord = dirWord;
+            }
+
+            // Haptic via app.js callback
             let corridorDir = 'CENTRE';
             if (ang > -65 && ang <= 0) corridorDir = 'RIGHT';
             else if (ang < -115 && ang >= -180) corridorDir = 'LEFT';
@@ -228,8 +260,15 @@ function handleCrossingPerception(result) {
             noDashStreak++;
         }
 
-        const lightBig = result.light && result.light.areaFrac >= END_LIGHT_AREA_FRAC;
-        if (noDashStreak >= END_NO_DASH_FRAMES && (lightBig || !result.light)) {
+        // Light switched to constant red mid-crossing
+        if (constantRed && !hurried) {
+            hurried = true;
+            speakThrottled('The light is red. Hurry to finish crossing.', true);
+        }
+
+        // End detection: dashes ran out + light close/gone
+        const lightBig = light && light.areaFrac >= END_LIGHT_AREA_FRAC;
+        if (noDashStreak >= END_NO_DASH_FRAMES && (lightBig || !light)) {
             window.navassist.onVisionArrivalSignal &&
                 window.navassist.onVisionArrivalSignal();
         }
@@ -299,7 +338,7 @@ function drawCrossTag(text, x, y, color, fp) {
 }
 
 // ============================================================
-// Render loop — stale-clear + minimal status HUD
+// Render loop
 // ============================================================
 function renderLoop(ts) {
     if (!started) return;
