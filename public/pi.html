@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NavAssist — Raspberry Pi camera (both models)</title>
+    <title>NavAssist — Raspberry Pi camera</title>
     <link rel="stylesheet" href="css/style.css">
     <style>
         body { overflow: auto; }
@@ -32,7 +32,7 @@
 <body>
     <div class="wrap">
         <div class="topbar">
-            <h1>🚦 Raspberry Pi camera — both models</h1>
+            <h1>🚦 Raspberry Pi camera</h1>
             <a href="webcam.html">↦ Laptop webcam version</a>
         </div>
 
@@ -43,9 +43,9 @@
             <canvas id="camFrame"></canvas>
             <!-- crossing_seg.onnx, run on the SERVER against the frame it already
                  has, pushed here over the same socket: dotted-line masks, corridor
-                 arrow, light-state banner. -->
+                 arrow, light box + state banner. -->
             <canvas id="crossOverlay"></canvas>
-            <!-- pedestrian.onnx, run in THIS browser's worker: boxes, green arrow, HUD. -->
+            <!-- HUD only (link fps · frame size · seg ms). -->
             <canvas id="detOverlay"></canvas>
         </div>
 
@@ -53,13 +53,8 @@
 
         <div class="controls">
             <label><input type="checkbox" id="crossChk" checked> Crossing model (server)</label>
-            <label><input type="checkbox" id="pedChk" checked> Pedestrian model (browser)</label>
             <label><input type="checkbox" id="muteChk"> Mute speech</label>
             <label><input type="checkbox" id="hudChk" checked> HUD</label>
-            <label>Confidence
-                <input type="range" id="confRange" min="5" max="90" value="35">
-                <span id="confVal">0.35</span>
-            </label>
         </div>
 
         <!-- Manual haptic test. pi.html has no state machine, so it never sends
@@ -72,30 +67,29 @@
             <button type="button" id="hapBoth">Both</button>
         </div>
 
-        <div class="statusline" id="status">Loading pedestrian.onnx…</div>
+        <div class="statusline" id="status"></div>
         <div class="statusline" id="crossState"></div>
         <div class="statusline" id="hapticState"></div>
 
         <div class="legend">
-            <b>pedestrian.onnx</b> — in this browser, on WebGPU (falls back to WASM):
-            <span class="sw" style="background:#ff1744"></span> red ·
-            <span class="sw" style="background:#00c853"></span> green ·
-            <span class="sw" style="background:#2979ff"></span> traffic-light post.
+            <b>crossing_seg.onnx</b> — the project's one perception model, run on the Node
+            server on a worker thread against the frame the Pi already sent it:
+            <span class="sw" style="background:#00e5ff"></span> cyan dotted-line crossing masks ·
+            corridor arrow · pedestrian-light box coloured by state
+            (<span class="sw" style="background:#00e676"></span> green ·
+            <span class="sw" style="background:#ffab00"></span> clearance ·
+            <span class="sw" style="background:#ff1744"></span> red).
             <br>
-            <b>crossing_seg.onnx</b> — on the Node server, on a worker thread, against the
-            frame the Pi already sent it: cyan dotted-line masks, corridor arrow, light-state banner.
-            <br>
-            The Pi is a <b>camera only</b> — a Zero 2W cannot run either model at a usable rate.
+            The Pi is a <b>camera only</b> — a Zero 2W cannot run the model at a usable rate.
             The server un-rotates its sideways frames (<code>PI_ROTATE</code>, default 90° CW)
-            so both models and this display agree on which way is up.
+            so the model and this display agree on which way is up.
             <br>
-            HUD reads: <code>link fps · frame size · pedestrian ms · crossing ms · det count</code>.
-            If you see no boxes, drop the confidence slider before assuming the model is broken.
+            HUD reads: <code>link fps · frame size · crossing ms</code>.
         </div>
     </div>
 
-    <!-- crossing.js exposes window.Crossing (FSM + overlay); pi.js owns the socket,
-         the frame decode, and pedestrian.onnx. -->
+    <!-- crossing.js exposes window.Crossing (FSM + overlay, fed the pushed result);
+         pi.js owns the socket and the frame decode. -->
     <script src="js/crossing.js"></script>
     <script src="js/pi.js"></script>
 </body>

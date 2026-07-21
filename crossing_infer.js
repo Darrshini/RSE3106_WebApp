@@ -221,8 +221,8 @@ async function infer(buf, opts) {
     const proto = out[s.outputNames[1]].data;                 // output1: 32 mask prototypes @160x160
     const dets = decode(out[s.outputNames[0]], pre.scale, pre.padX, pre.padY, pre.w, pre.h);
     const dottedDets = dets.filter(d=>d.cls===DOTTED);
-    const lights = dets.filter(d=>d.cls===LIGHT).sort((a,b)=>b.score-a.score);
-    const light = lights[0] || null;
+    const lightDets = dets.filter(d=>d.cls===LIGHT).sort((a,b)=>b.score-a.score);
+    const light = lightDets[0] || null;
 
     // Segmentation mask per dotted line -- this (not the box) drives everything.
     const masks = [];
@@ -233,18 +233,24 @@ async function infer(buf, opts) {
     const lines = masks.filter(m => m.count >= 8 && m.elong >= 2.0)   // genuine line segments
                        .map(m => ({ cx:m.cx, cy:m.cy, dx:m.dx, dy:m.dy, count:m.count }));
 
-    let lightOut = null;
-    if (light) {
-        const ls = lightState(pre.origRaw, pre.w, pre.h, light);
-        lightOut = { box:[light.x1,light.y1,light.x2,light.y2], conf:light.score,
-                     green: ls.green, red: ls.red, state: ls.state,
-                     areaFrac: ((light.x2-light.x1)*(light.y2-light.y1))/(pre.w*pre.h) };
-    }
+    // Read the state of EVERY pedestrian light in frame, not just the strongest.
+    // The browser's SCANNING logic (which used to run on pedestrian.onnx's
+    // 'traffic-light' boxes) needs all of them to offer a left/right post choice
+    // when two are visible. `light` stays the primary (highest-conf) one, which is
+    // what the WAITING/CROSSING light-state decisions read.
+    const lightsOut = lightDets.map(l => {
+        const ls = lightState(pre.origRaw, pre.w, pre.h, l);
+        return { box:[l.x1,l.y1,l.x2,l.y2], conf:l.score,
+                 green: ls.green, red: ls.red, state: ls.state,
+                 areaFrac: ((l.x2-l.x1)*(l.y2-l.y1))/(pre.w*pre.h) };
+    });
+    const lightOut = lightsOut[0] || null;
     const cor = corridor(lines, light, pre.w, pre.h);
     const lowestMaskY = masks.length ? Math.max(...masks.map(m=>m.maxY)) : null;   // mask-based, not box
     return {
         w: pre.w, h: pre.h,
         light: lightOut,
+        lights: lightsOut,
         dotted: masks.map(m => ({ mask:m.client, conf:m.conf })),   // segmentation bitmap, not a box
         corridor: cor,
         signals: {

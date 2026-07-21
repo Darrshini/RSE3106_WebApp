@@ -12,29 +12,38 @@ Hardware: **Raspberry Pi Zero 2W + Camera Module v3**, worn on the glasses, moun
 The Pi captures 640×480 JPEGs with its hardware encoder and pushes the raw bytes over a
 WebSocket. The Node server relays those bytes untouched to every browser watching, and — on a
 worker thread, on the same frame it just relayed — runs the crossing segmentation model and
-pushes the result down the same socket. The browser draws the frame, runs the pedestrian model
-on it locally, and makes every actual decision. Nobody re-uploads a frame to anybody.
+pushes the result down the same socket. The browser draws the frame and makes every actual
+decision from that pushed result; it runs no model of its own. Nobody re-uploads a frame to
+anybody.
 
 ```
 Pi Zero 2W                      Node server                     Browser (index.html)
 ──────────                      ───────────                     ────────────────────
 picamera2                                                       app.js  — socket, GPS, FSM
-  └ hardware MJPEG              /pi  ──┬── relay bytes ──►      ai.js   — decode, rotate, draw
-      └ raw JPEG bytes ─────────►      │                          └ inference.worker.js
-        (binary WS frame)              └── crossing_worker.js         └ pedestrian.onnx
-                                            └ crossing_seg.onnx           (WebGPU / WASM)
+  └ hardware MJPEG              /pi  ──┬── relay bytes ──►      ai.js   — decode, rotate, draw,
+      └ raw JPEG bytes ─────────►      │                                  draw crossing overlay
+        (binary WS frame)              └── crossing_worker.js             (no model in the browser)
+                                            └ crossing_seg.onnx
         ◄──────── haptic/command ────────┘        │
                                                   └── crossing/result ──► /live
 ```
 
 ## Which model runs where, and why not on the Pi
 
+There is **one** model. It runs on the Node server, never on the Pi and never in the browser:
+
 | Model | Classes | Where | How |
 |---|---|---|---|
-| `pedestrian.onnx` | red, green, traffic-light | **Browser** | onnxruntime-web in `js/inference.worker.js`, WebGPU → WASM fallback. Self-hosted runtime under `public/vendor/onnxruntime/` (not a CDN, so it works with no internet). |
 | `crossing_seg.onnx` | dotted line, pedestrian light | **Node server** | onnxruntime-node in `crossing_worker.js`, a worker thread. |
 
-**Neither runs on the Pi, and neither should.** A Zero 2W is 4× Cortex-A53 @1GHz with 512 MB of
+This single YOLO11-seg model does everything: the dotted-line crossing corridor *and* the
+pedestrian light, whose red/green/clearance state the server reads from the lit pixels. It
+replaced an earlier browser-side `pedestrian.onnx` (run via onnxruntime-web in
+`js/inference.worker.js`, WebGPU→WASM). That model and its worker are **gone** — the browser
+now runs no neural net, so the self-hosted onnxruntime runtime under `public/vendor/onnxruntime/`
+is no longer loaded by the app either.
+
+**It must not run on the Pi.** A Zero 2W is 4× Cortex-A53 @1GHz with 512 MB of
 RAM. A YOLO11 pass on it takes seconds. Moving inference there wouldn't speed the system up, it
 would stop it working. The Pi does the one thing its silicon is genuinely good at — capture and
 JPEG-encode — and ships the bytes.
@@ -167,12 +176,14 @@ JSON: `{ topic, timestamp, payload }`.
 | `/live` | browsers (`index.html`, `pi.html`) | binary JPEGs down; `connection/event`, `crossing/result` down; `haptic/command`, `live/config` up |
 
 - `connection/event` → `{ event: 'pi_connected' | 'pi_disconnected', rotate: 90 }`
-- `crossing/result` → `{ w, h, light, dotted, corridor, signals, inferMs }`, in **upright**
-  coordinates (the server already un-rotated the frame)
+- `crossing/result` → `{ w, h, light, lights, dotted, corridor, signals, inferMs }`, in
+  **upright** coordinates (the server already un-rotated the frame). `light` is the primary
+  (highest-confidence) pedestrian light; `lights` is every pedestrian light in frame (each with
+  box + state), which the client's SCANNING logic uses to offer a left/right post choice.
 - `live/config` → `{ crossing: false }` tells the **server** to stop inferring for this viewer.
   It has to stop the server, not just stop the browser drawing: you're probably viewing the page
-  on the same laptop that runs the server, so an unwanted seg model still steals CPU from
-  `pedestrian.onnx`.
+  on the same laptop that runs the server, so an idle seg model would still burn CPU on it for
+  nothing.
 
 `/browser` and `/esp32` still exist in `server.js` but **nothing connects to them**. That's the
 dead ESP32 path; delete it whenever you like.
@@ -188,8 +199,8 @@ dead ESP32 path; delete it whenever you like.
 | `crossing_worker.js` | Worker thread. Keeps `crossing_seg.onnx` off the event loop. |
 | `crossing_infer.js` | The actual seg model + `sharp` preprocessing + mask decode. |
 | `public/js/app.js` | `/live` socket, binary vs JSON split, GPS, state machine, haptics. |
-| `public/js/ai.js` | Decode → rotate → draw → `pedestrian.onnx`; folds `crossing/result` into the FSM. |
-| `public/js/pi.js` | `pi.html`'s test bench. Same feed, same models, plus HUD and confidence slider. |
+| `public/js/ai.js` | Decode → rotate → draw the frame + crossing overlay; folds `crossing/result` into the FSM. No browser model. |
+| `public/js/pi.js` | `pi.html`'s test bench. Same feed + crossing overlay (via `crossing.js`), plus a HUD. |
 
 ---
 
@@ -219,7 +230,8 @@ Both ends print once a second, and together they tell you exactly where a bottle
   `--quality`, or `--width` before you go blaming the models.
 - **Server** — `[pi] 15 fps  118 KB/s`.
   If this is well below the Pi's configured FPS, the bottleneck is the WiFi link, not inference.
-- **Browser HUD** (`pi.html`) — `15 fps  480×640  webgpu 42ms  seg 190ms  2 det`.
+- **Browser HUD** (`pi.html`) — `15 fps  480×640  seg 190ms`. `seg` is the server's crossing
+  inference time, sent down with each result.
 
 ---
 
@@ -227,11 +239,10 @@ Both ends print once a second, and together they tell you exactly where a bottle
 
 - **The nested folder.** The zip extracts `RSE3106_WebApp-main/RSE3106_WebApp-main/`. The real
   root is the one with `server.js` + `package.json` in it.
-- **WebGPU needs a secure context.** On `localhost` you get `webgpu` in the HUD. Over plain
-  `http://<lan-ip>` it silently falls back to `wasm` — noticeably slower, still functional. The
-  AWS box's HTTPS solves this properly.
-- **First load stalls for a few seconds.** `pedestrian.onnx` is ~38 MB and must download before
-  the worker signals ready. Normal, not a hang.
+- **No in-browser model anymore.** The old WebGPU/WASM gotcha (browser inference needing a
+  secure context, and a ~38 MB `pedestrian.onnx` download stalling first load) is gone with it:
+  the browser runs no neural net now, so there is nothing to download or GPU-accelerate. The one
+  model loads on the **server** at startup (`[infer] model loaded …` in the server log).
 - **Camera Module v3 focus is pinned at infinity.** The pedestrian light we care about is across
   the road, so the script sets manual focus at infinity (`AfMode=Manual`, `LensPosition=0.0`
   dioptres) rather than letting continuous AF hunt onto near clutter — the wearer's own body, a
@@ -239,9 +250,11 @@ Both ends print once a second, and together they tell you exactly where a bottle
   from a few metres out to the horizon, which is the whole range that matters. It prints
   `[cam] focus fixed at infinity (manual, LensPosition 0.0)`. On a v2 (fixed focus) the control is
   unavailable and skipped, which is fine — a v2 is already focused near infinity.
-- **Seeing no detections?** Try `pi.html` and slide the confidence threshold down before
-  concluding anything is broken. `model_test.html` drops its threshold to 0.08 specifically to
-  chase near-misses, which tells you this model can score low on real scenes.
+- **Seeing no detections?** The confidence threshold is now a **server-side constant** (`CONF`
+  in `crossing_infer.js`, default `0.30`) — there is no in-page slider anymore, since the model
+  runs on the server. Lower `CONF` there to chase near-misses if the model is scoring low on a
+  real scene, then restart the server. `model_test.html` (single uploaded photo → `/api/infer`)
+  is the quickest way to eyeball what the model actually returns for a given frame.
 
 ---
 
@@ -261,5 +274,5 @@ and `/live` with a simulated Pi pushing real JPEGs at 15fps:
 
 **Not verified:** the live render against a real scene — real camera, real crossing, real
 detection quality. Driving physical hardware wasn't possible in that session. The plumbing is
-proven; the perception isn't. If detections look wrong, suspect the confidence threshold (above)
-before suspecting the decode.
+proven; the perception isn't. If detections look wrong, suspect the server-side `CONF` threshold
+(above) before suspecting the decode.

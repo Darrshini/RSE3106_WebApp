@@ -120,20 +120,24 @@ The buttons prove the **transport**: browser → server → Pi → motor. They d
 AI triggers a buzz, and this is the thing that already wasted an evening once:
 
 **`pi.html` has no state machine.** No GPS, no compass, **no automatic haptics** — the Left/Right/
-Both buttons are the only haptic path on that page. A traffic light detected on `pi.html` will
+Both buttons are the only haptic path on that page. A light detected on `pi.html` will
 **never** move a motor on its own. Same for `webcam.html`. That is by design, not a bug.
 
-Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states:
-- `onDirectionDecided` (`app.js:672`) returns immediately unless state is **`NAVIGATING`**
-- `onGreenDirection` (`app.js:717`) buzzes the green-man side only while **`WAITING`**
-- corridor drift-correction (`app.js:756`) requires **`CROSSING`**
-- reaching `NAVIGATING` means: detect a **traffic-light *post*** → **double-tap confirm**
+Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states.
+All of them are now driven by the server's `crossing_seg` result (the pedestrian light + its
+state, and the dotted-line corridor) — there is no browser model feeding them anymore:
+- `onDirectionDecided` returns immediately unless state is **`NAVIGATING`** (buzz toward the
+  pedestrian light as you approach it)
+- `onGreenDirection` buzzes the green-man side while **`WAITING`** *or* **`SCANNING`**
+- corridor drift-correction requires **`CROSSING`**
+- reaching `NAVIGATING` means: detect the **pedestrian light** → **double-tap confirm**
 
-So opening `index.html`, pointing at a **green man**, and expecting a buzz will not work — you
-sit in `SCANNING`, where no haptic path exists, and a green man isn't even what advances SCANNING
-(a traffic-light *post* is). There are also deliberate cooldowns
-(`CROSSING_HAPTIC_COOLDOWN_MS = 1500`, `GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000`) so it will
-not buzz every frame even when it is working.
+So on `index.html`, pointing at a **green pedestrian light** while `SCANNING` *does* buzz now
+(`onGreenDirection` fires in `SCANNING`), and the same detection also offers the light as a
+target (`onTrafficLightVisible` → confirm). On **`pi.html` / `webcam.html`** it still won't —
+those pages have no state machine at all, only the manual buttons. Deliberate cooldowns
+(`CROSSING_HAPTIC_COOLDOWN_MS = 1500`, `GREEN_DIRECTION_HAPTIC_COOLDOWN_MS = 1000`) keep it from
+buzzing every frame even when it is working.
 
 **Get the transport green on `pi.html` first.** If a button buzzes, any failure on
 `index.html` is state-machine logic, not plumbing — a much smaller haystack.
@@ -231,16 +235,16 @@ breakout, you will eventually take the pin — or the SoC — with them.
 
 ## If you're picking this up cold
 
-Read `PI_REALTIME.md` first — it's the main camera path and explains why the Pi runs neither
+Read `PI_REALTIME.md` first — it's the main camera path and explains why the Pi runs no
 model. The short version of the model layout, since it confuses everyone:
 
 | Model | Classes | Runs |
 |---|---|---|
-| `pedestrian.onnx` | red, green, traffic-light | **Browser**, onnxruntime-web in a worker |
 | `crossing_seg.onnx` | **dotted line**, pedestrian light | **Node server**, onnxruntime-node on a worker thread |
 
-Neither runs on the Pi. The dotted-line/crossing model's output is drawn on `pi.html` and
-`webcam.html`, and now also on `index.html` (a draw-only overlay was added — see `ai.js`
-`drawCrossingOverlay`), while on `index.html` it *additionally* feeds the state machine
-(haptic drift correction + light-state read). Motors are driven only from `app.js`
-(`index.html`), never from `pi.js`/`webcam.js`.
+This is now the **only** model (an earlier browser-side `pedestrian.onnx` was folded into it and
+removed — see `README.md`). It runs on the server, never on the Pi and never in the browser. Its
+output is drawn on `pi.html`, `webcam.html` and `index.html` (`ai.js` `drawCrossingOverlay`),
+and on `index.html` it *additionally* feeds the state machine — the pedestrian-light state, the
+SCANNING post detection, and the corridor drift correction all come from it. Motors are driven
+only from `app.js` (`index.html`), never from `pi.js`/`webcam.js`.

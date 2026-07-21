@@ -187,8 +187,7 @@ async function loadServerInfo() {
         const cfg = await res.json();
         serverInfoEl.textContent =
             `Connected to: ${location.host}\n` +
-            `Models: ${cfg.pedestrianModel || 'pedestrian.onnx'} + ` +
-            `${cfg.crossingModel || 'crossing_seg.onnx'}`;
+            `Model: ${cfg.crossingModel || 'crossing_seg.onnx'}`;
     } catch (e) {
         serverInfoEl.textContent = `Server: ${location.host}`;
     }

@@ -30,18 +30,23 @@ Raspberry Pi Zero 2W + Camera Module v3 (glasses hardware)
 ```
 
 **The Pi is a camera, not a brain.** It captures JPEG frames and ships the bytes; that is all
-it does. The two AI models run in two *other* places, and neither runs on the Pi:
+it does. There is **one** AI model, and it does not run on the Pi:
 
 | Model | Classes | Runs |
 |---|---|---|
-| `pedestrian.onnx` | `red`, `green`, `traffic-light` | **In the browser**, via onnxruntime-web in a Web Worker (`js/inference.worker.js`). WebGPU where available, else WASM. |
 | `crossing_seg.onnx` | `dotted line`, `pedestrian light` | **On the Node server**, via onnxruntime-node on a worker thread (`crossing_worker.js`). |
+
+This one YOLO11-seg model does the whole job: it segments the **dotted-line crossing** *and*
+detects the **pedestrian light**, whose red/green/clearance state the server reads from the lit
+pixels (HSV) per frame. It replaced an earlier browser-side `pedestrian.onnx` (classes
+`red`/`green`/`traffic-light`) — that model, its Web Worker (`js/inference.worker.js`) and all
+in-browser inference are **gone**; the browser now runs no neural net at all.
 
 A Zero 2W is 4× Cortex-A53 @1GHz with 512 MB of RAM — a YOLO11 pass on it takes *seconds*,
 not milliseconds. Moving inference onto the Pi wouldn't make the system faster, it would stop
-it working at all. So the Pi encodes and sends, the server segments, and the browser detects.
+it working at all. So the Pi encodes and sends, and the server segments and reads the light.
 All the *decisions* (state machine, GPS/crossing logic, confirmations, speech) live in the
-browser, in `app.js`.
+browser, in `app.js`, fed by the server's `crossing/result` messages.
 
 ### Hardware history
 
@@ -94,7 +99,7 @@ A `.env` file is optional — copy it only if you want to change the port:
 cp .env.example .env   # then edit PORT if 3000 is taken
 ```
 The `GOOGLE_MAPS_API_KEY` and `ROBOFLOW_*` entries in `.env.example` are **legacy and unused**:
-the map lookup moved to Overpass, and both models now run locally (browser + Node), not Roboflow.
+the map lookup moved to Overpass, and the model now runs locally on the Node server, not Roboflow.
 
 ### 3. Start the server
 ```bash
@@ -133,11 +138,11 @@ server, and the web app's status bar should show "Glasses connected."
 
 | Page | What it's for |
 |---|---|
-| `index.html` | **The real app.** Pi feed + both models + GPS + state machine + speech. |
-| `pi.html` | Pi camera test bench — the same feed and both models, with an FPS/latency HUD and a live confidence slider, but no GPS or state machine. **Use this to debug the vision stack.** |
-| `webcam.html` | Same two models against a **laptop webcam**, no Pi involved. See `WEBCAM_REALTIME.md`. |
+| `index.html` | **The real app.** Pi feed + the model + GPS + state machine + speech. |
+| `pi.html` | Pi camera test bench — the same feed and model, with an FPS/latency HUD, but no GPS or state machine. **Use this to debug the vision stack.** |
+| `webcam.html` | The same model against a **laptop webcam**, no Pi involved. See `WEBCAM_REALTIME.md`. |
 | `test.html` | Crossing model against an **uploaded video file**. |
-| `model_test.html` | Single-image `pedestrian.onnx` debugging, with a very low confidence threshold. |
+| `model_test.html` | Single-image debugging: POSTs an uploaded photo to the server's `/api/infer` and draws the crossing masks + light state. |
 | `settings.html` | App settings. |
 
 ---

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NavAssist — Webcam (both models)</title>
+    <title>NavAssist — Webcam</title>
     <link rel="stylesheet" href="css/style.css">
     <style>
         body { overflow: auto; }
@@ -29,47 +29,45 @@
 <body>
     <div class="wrap">
         <div class="topbar">
-            <h1>🚦 Webcam — pedestrian.onnx + crossing_seg.onnx</h1>
-            <a href="live.html">↦ Crossing model only</a>
+            <h1>🚦 Webcam — crossing_seg.onnx</h1>
+            <a href="pi.html">↦ Raspberry Pi camera version</a>
         </div>
 
         <div class="camera-view">
             <video id="feed" playsinline muted autoplay></video>
-            <!-- crossing_seg (server /api/infer): dotted-line masks, corridor arrow, banner -->
+            <!-- crossing_seg (server /api/infer): dotted-line masks, corridor arrow,
+                 light box + state banner -->
             <canvas id="crossOverlay"></canvas>
-            <!-- pedestrian.onnx (in-browser worker): boxes, green arrow, HUD -->
+            <!-- HUD only -->
             <canvas id="detOverlay"></canvas>
         </div>
 
         <div class="controls">
             <button id="startBtn" class="btn">Start camera</button>
-            <label><input type="checkbox" id="crossChk" checked> Crossing model (server)</label>
             <label><input type="checkbox" id="muteChk"> Mute speech</label>
             <label><input type="checkbox" id="hudChk" checked> HUD</label>
-            <label>Confidence
-                <input type="range" id="confRange" min="5" max="90" value="35">
-                <span id="confVal">0.35</span>
-            </label>
         </div>
 
-        <div class="statusline" id="status">Click “Start camera”, allow access, then point at a pedestrian light.</div>
+        <div class="statusline" id="status">Click “Start camera”, allow access, then point at a pedestrian crossing / light.</div>
         <div class="statusline" id="crossState"></div>
 
         <div class="legend">
-            <b>pedestrian.onnx</b> — runs in your browser on WebGPU (falls back to WASM), boxes only:
-            <span class="sw" style="background:#ff1744"></span> red ·
-            <span class="sw" style="background:#00c853"></span> green ·
-            <span class="sw" style="background:#2979ff"></span> traffic-light post.
+            <b>crossing_seg.onnx</b> — the project's one perception model, run on the Node
+            server via <code>/api/infer</code>:
+            <span class="sw" style="background:#00e5ff"></span> cyan dotted-line segmentation masks ·
+            the corridor arrow toward the vanishing point ·
+            the pedestrian-light box coloured by state
+            (<span class="sw" style="background:#00e676"></span> green ·
+            <span class="sw" style="background:#ffab00"></span> clearance ·
+            <span class="sw" style="background:#ff1744"></span> red).
             <br>
-            <b>crossing_seg.onnx</b> — runs on the Node server via <code>/api/infer</code>:
-            cyan dotted-line segmentation masks, the corridor arrow toward the vanishing point,
-            and the light-state banner.
-            <br>
-            Both read the same webcam. Uncheck the crossing model to give pedestrian.onnx the whole machine.
+            js/crossing.js captures webcam frames, POSTs them, draws the overlay, and runs the
+            crossing decision FSM. The browser runs no neural net of its own.
         </div>
     </div>
 
-    <!-- crossing.js exposes window.Crossing; webcam.js starts it and owns pedestrian.onnx -->
+    <!-- crossing.js exposes window.Crossing (capture + overlay + FSM); webcam.js
+         hands it the webcam and draws a small HUD. -->
     <script src="js/crossing.js"></script>
     <script src="js/webcam.js"></script>
 </body>

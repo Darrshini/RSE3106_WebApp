@@ -682,8 +682,9 @@ window.navassist.onArrived = function() {
         setTimeout(() => {
             if (currentState === STATES.REACHED) {
                 // Neutral message here -- we don't yet know the actual light
-                // color. ai.js's red/green detection (handleGuidance) speaks
-                // the real state within moments of entering WAITING.
+                // color. ai.js reads the crossing_seg light state (from
+                // crossing/result) and speaks the real state within moments of
+                // entering WAITING.
                 transitionTo(STATES.WAITING, 'Checking the signal…');
             }
         }, 2000);

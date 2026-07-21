@@ -1,7 +1,7 @@
 # Real-time webcam mode (`webcam.html`) — notes
 
-A page that runs both of the project's AI models in real time against a **laptop/PC webcam**,
-with no Raspberry Pi, no WebSocket relay, and no phone involved.
+A page that runs the project's AI model in real time against a **laptop/PC webcam**, with no
+Raspberry Pi, no WebSocket relay, and no phone involved.
 
 > **Read `PI_REALTIME.md` first if you're working on the real app.** The Pi is the actual
 > hardware; `index.html` runs off it. This page is a **development convenience** — it exists so
@@ -10,7 +10,8 @@ with no Raspberry Pi, no WebSocket relay, and no phone involved.
 | File | Role |
 |---|---|
 | `public/webcam.html` | The page: video element, two stacked overlay canvases, controls |
-| `public/js/webcam.js` | Grabs webcam frames, drives `pedestrian.onnx`, starts the crossing model |
+| `public/js/webcam.js` | Grabs the webcam, hands the `<video>` to `crossing.js`, draws a small HUD |
+| `public/js/crossing.js` | The actual pipeline: captures frames, POSTs to `/api/infer`, draws the overlay, runs the crossing FSM |
 
 ---
 
@@ -20,7 +21,7 @@ The stock app gets its camera frames from the Pi over a WebSocket and its headin
 phone's compass. Without a Pi you get no frames, and without a phone you get no compass — so on
 a bare laptop you can't exercise the perception stack at all.
 
-`webcam.html` bypasses both and feeds the **webcam** into the same two models.
+`webcam.html` bypasses both and feeds the **webcam** into the model.
 
 If you *do* have the Pi on hand, prefer **`pi.html`** instead: it's the same idea but against
 the real camera, so what you see is what the real app sees (same lens, same mounting angle, same
@@ -28,26 +29,23 @@ frame size, same JPEG artefacts). `webcam.html` is the fallback when the Pi isn'
 
 ---
 
-## The project has TWO models, in two different places
+## The project has ONE model, on the server
 
-This trips people up, so it's worth stating plainly.
+This used to be two models; it is now one. Worth stating plainly because older notes (and older
+code) assumed two.
 
-**1. `public/models/pedestrian.onnx`** — classes `['red', 'green', 'traffic-light']`.
-Runs **in the browser**, via `onnxruntime-web`, inside a Web Worker
-(`public/js/inference.worker.js`) so inference never blocks the video or the UI. Tries WebGPU
-first, falls back to WASM. The runtime is **self-hosted** under `public/vendor/onnxruntime/`
-(deliberately not a CDN, so it works with no internet).
-
-**2. `public/models/crossing_seg.onnx`** — a YOLO11-**seg** model, classes
+**`public/models/crossing_seg.onnx`** — a YOLO11-**seg** model, classes
 `['dotted line', 'pedestrian light']`. Runs **on the Node server**, via `onnxruntime-node`, on a
-worker thread. It is stateless per frame; all temporal decisions live client-side.
+worker thread. It is stateless per frame; all temporal decisions live client-side. It does the
+whole perception job: it segments the dotted-line crossing corridor *and* detects the pedestrian
+light, whose red/green/clearance state the server reads from the lit pixels (HSV).
 
-`webcam.html` runs **both at once, against the same webcam feed.**
+There is **no in-browser model**. An earlier `pedestrian.onnx` (classes `red`/`green`/
+`traffic-light`) used to run here in a Web Worker (`js/inference.worker.js`) via
+`onnxruntime-web`; it was a subset of `crossing_seg.onnx`, so it and its worker were removed. The
+browser now runs no neural net — it only captures webcam frames, POSTs them, and draws.
 
-### How the crossing model gets its frames here — and why that differs from the Pi
-
-This is the one real asymmetry between this page and the Pi path, and it's worth understanding
-before you "fix" anything:
+### How the crossing model gets its frames — and why that differs from the Pi
 
 - **`webcam.html`** POSTs a JPEG to **`POST /api/infer`** and gets a result back. It has to:
   the frame originates in the browser, and the server has never seen it.
@@ -63,53 +61,40 @@ in use by `webcam.html`, `live.html`, and `test.html`.
 
 ## How `webcam.js` works
 
-1. `getUserMedia()` → a `<video>` element (`#feed`).
-2. On every animation frame (`renderLoop`), it sizes the overlay canvas to the video's native
-   pixel dimensions and calls `maybeInfer()`.
-3. `maybeInfer()` is throttled two ways, and both matter:
-   - `INFER_EVERY_MS = 100` — a *floor* between inferences, so a fast machine doesn't peg a core.
-   - `inferBusy` — a hard guarantee that only **one** inference is in flight at a time. On a slow
-     machine this is what actually paces things; the floor never bites. This is why a slow model
-     degrades to a lower frame rate instead of building an ever-growing backlog.
-4. `preprocess()` letterboxes the current video frame into a 640×640 CHW `Float32Array` (grey
-   `rgb(114,114,114)` padding, matching Ultralytics).
-5. The buffer is **transferred** (zero-copy, not cloned) to `inference.worker.js`, which runs
-   `session.run()`, decodes the YOLO output, does NMS, and posts back `{ detections, inferMs }`.
-6. `draw()` renders boxes, a cyan arrow from bottom-centre (the "user") to the strongest green
-   man, and a HUD.
+It is deliberately thin now that there is no browser model to drive:
 
-The crossing model needs none of this plumbing: `crossing.js` exposes
-`window.Crossing.start(videoEl, overlayEl, onStatus)` and runs its own capture → `/api/infer` →
-draw loop. `webcam.js` just hands it the same `<video>` and a **second, separate canvas**, so the
-two models' overlays never fight over one drawing context.
+1. `getUserMedia()` → a `<video>` element (`#feed`).
+2. Hands that `<video>` (and the `#crossOverlay` canvas) to **`window.Crossing.start()`** from
+   `crossing.js`. From there `crossing.js` owns everything: it captures frames off the video,
+   POSTs them to `/api/infer`, draws the masks / light box / corridor arrow / banner onto
+   `#crossOverlay`, and runs the crossing decision FSM.
+3. `webcam.js`'s own `renderLoop` does just two things: size the `#detOverlay` canvas to the
+   video, and draw a small **fps HUD** on it. No inference, no boxes.
+4. It also defines `window.navassist.speak` — that's the hook `crossing.js` speaks through, and
+   gating it is how the **Mute speech** checkbox silences the FSM's spoken cues without touching
+   `crossing.js`.
+
+All the heavy lifting — capture throttling (`INFER_MS` floor + one request in flight at a time),
+letterbox, decode, NMS, the light-state read — happens in `crossing.js` and on the server, not
+here.
 
 ### Coordinate spaces (important if you touch the drawing code)
 
-The two overlays work in **different pixel spaces**, and that is fine:
+The two overlay canvases work in **different pixel spaces**, and that is fine:
 
-- `#detOverlay` is sized to `video.videoWidth × videoHeight`, because `inference.worker.js`
-  returns boxes already mapped back to original-frame pixels (it undoes the letterbox using
-  `scale`/`padX`/`padY`).
+- `#detOverlay` is sized to `video.videoWidth × videoHeight` and now carries **only the HUD**.
 - `#crossOverlay` is sized by `crossing.js` to the server's reported `r.w × r.h`, which is the
   **downscaled** capture (`CAP_W = 960`).
 
 Both canvases are CSS-stretched over the same video box, so they line up visually despite the
-differing internal resolutions. Don't "fix" this by forcing them to match — you'd break one of
-the two mappings.
-
-### Speech muting
-
-`crossing.js` speaks via `window.navassist.speak` if it exists, else falls back to
-`speechSynthesis` directly. `webcam.js` therefore **defines** `window.navassist.speak` itself,
-and that function is what the mute checkbox gates. That's why muting works without editing
-`crossing.js`.
+differing internal resolutions. Don't "fix" this by forcing them to match — you'd break the
+crossing overlay's mapping.
 
 ### No rotation here
 
 `ai.js` un-rotates incoming Pi frames (the glasses camera is mounted sideways; the server is the
-source of truth for the angle — see `PI_REALTIME.md`). A webcam is already upright, so
-`webcam.js` does **no** rotation. If you ever point this at a sideways camera, that's what to
-add.
+source of truth for the angle — see `PI_REALTIME.md`). A webcam is already upright, so nothing on
+this page rotates. If you ever point this at a sideways camera, that's what to add.
 
 ---
 
@@ -129,14 +114,14 @@ involved — the Overpass/GPS/Google-Maps paths belong to `index.html` only.
 
 ### Controls on the page
 
-- **Crossing model (server)** — uncheck to disable `/api/infer` and give `pedestrian.onnx` the
-  whole machine.
+- **Start camera** — asks for webcam permission and begins.
 - **Mute speech** — silences the crossing FSM's spoken cues.
-- **HUD** — top-left readout: `ready | backend | N det | fps | inference ms | conf threshold`.
-- **Confidence slider** — live-adjustable detection threshold. **Use this before concluding the
-  model is broken.** The default is 0.35, but `model_test.html` drops its threshold to 0.08
-  specifically to debug near-misses, which suggests this model can score low on real scenes. If
-  you see no boxes, slide it down.
+- **HUD** — top-left readout on `#detOverlay`: `crossing_seg (server) · fps`.
+
+The confidence threshold is **not** adjustable from this page anymore — it's a server-side
+constant (`CONF` in `crossing_infer.js`, default `0.30`), since the model runs on the server. If
+the model scores low on a real scene and you want to chase near-misses, lower `CONF` there and
+restart the server.
 
 ---
 
@@ -145,10 +130,10 @@ involved — the Overpass/GPS/Google-Maps paths belong to `index.html` only.
 - **`getUserMedia` needs a secure context.** `localhost` counts as secure, so plain HTTP works
   there. Opening the page from a phone at `http://<lan-ip>:3000` will fail to get the camera at
   all. For local webcam work, just stay on `localhost`.
-- **WebGPU also needs a secure context**, for the same reason. On `localhost` you should get
-  `webgpu` in the HUD; over LAN HTTP it silently falls back to `wasm` — slower, still functional.
-- **First load stalls for a few seconds.** `pedestrian.onnx` is ~38 MB and must download before
-  the worker signals ready. Normal, not a hang.
+- **No in-browser model anymore**, so the old WebGPU / WASM / ~38 MB-model-download gotchas are
+  gone. If the overlay is blank, the thing to check is that the **server is running** (the model
+  loads there at startup — `[infer] model loaded …` in the server log) and that `/api/infer` is
+  returning results (watch the Network tab, or use `model_test.html`).
 - **The `<video>` uses `object-fit: cover`**, so a webcam whose aspect ratio differs from 16:9 is
   visually cropped while the model still sees the full uncropped frame. Cosmetic, but it can make
   a box look slightly misplaced near the edges.
@@ -157,23 +142,26 @@ involved — the Overpass/GPS/Google-Maps paths belong to `index.html` only.
 
 ## History
 
-This page was originally added as a self-contained two-file addition that touched nothing else.
-**That is no longer true**, and the old version of this document claiming so is out of date:
+This page began as a self-contained two-file addition (`webcam.html` + `webcam.js`) that ran a
+browser-side `pedestrian.onnx` and layered the server crossing model on top. It has changed twice
+since:
 
 - `crossing.js` gained `startExternal()` and `push()` so `pi.js` could drive it from
   WebSocket-pushed results instead of its own `/api/infer` loop. `webcam.js`'s use of
   `Crossing.start()` is unaffected.
 - `server.js` gained the `/pi` and `/live` paths and moved the crossing model onto a worker
   thread (`crossing_worker.js`).
-- `app.js` and `ai.js` were migrated onto the Pi's binary `/live` feed.
+- **The browser `pedestrian.onnx` and its worker were removed.** `crossing_seg.onnx` is a
+  superset, so `webcam.js` was reduced to a thin webcam-capture + HUD shell around `crossing.js`,
+  which is now the entire perception pipeline on this page.
 
-`webcam.html` and `webcam.js` themselves still work exactly as described above.
+---
 
 **Verified:** `npm install` is clean (`onnxruntime-node` and `sharp` both ship Windows prebuilts,
 no native compile step); `crossing_seg.onnx` loads at server start; `POST /api/infer` returns a
-well-formed result; `pedestrian.onnx`'s graph output is `[1, 7, 8400]`, so the worker's
-`nCls = dims[1] - 4` derives **3**, exactly matching `['red','green','traffic-light']` — the main
-thing that could have silently produced garbage boxes.
+well-formed result (`{ w, h, light, lights, dotted, corridor, signals, inferMs }`) for a posted
+frame — confirmed by driving the endpoint directly.
 
-**Not verified:** the live webcam render — camera permission prompt, box drawing against a real
-scene, detection quality. Driving a physical webcam wasn't possible in that session.
+**Not verified:** the live webcam render — camera permission prompt, `crossing.js` drawing
+against a real scene, detection quality. Driving a physical webcam wasn't possible in that
+session.
