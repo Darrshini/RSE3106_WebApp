@@ -62,6 +62,14 @@ let armedGestures = [];
 // hurry) -- those don't change state, so the guard never touches them.
 let crossingLocked = false;
 
+// Set true once vision judges the crossing is ending (dashes gone + far light
+// close/absent). It does NOT auto-complete the crossing any more; instead it
+// arms a single-tap confirmation -- the user feels for the tactile pavement and
+// taps the screen once they're safely on the far kerb. Cleared on completion.
+let crossingEndPending = false;
+let lastEndPromptAt = 0;
+const END_PROMPT_REPEAT_MS = 6000;  // re-prompt cadence until the user confirms
+
 function transitionTo(newState, message) {
     if (crossingLocked && currentState === STATES.CROSSING &&
         newState !== STATES.COMPLETED && newState !== STATES.LOST_CONNECTION) {
@@ -300,7 +308,6 @@ let crossingHapticTimerId = null;
 let lastCrossingDistance = 0;
 let lastCrossingProgressAt = 0;
 let crossingStallWarned = false;
-const CROSSING_DISTANCE_THRESHOLD_M = 8;
 const CROSSING_PROGRESS_MIN_DELTA_M = 1;
 const CROSSING_STALL_WARNING_MS = 8000;
 const CROSSING_ABSOLUTE_CEILING_MS = 90000;
@@ -321,6 +328,15 @@ function distanceMeters(lat1, lng1, lat2, lng2) {
 
 function checkCrossingStall() {
     if (currentState !== STATES.CROSSING) return;
+    // Once the crossing is ending, don't nag the user to "keep going" -- they've
+    // arrived. Instead, gently re-prompt them to confirm on the screen.
+    if (crossingEndPending) {
+        if (Date.now() - lastEndPromptAt >= END_PROMPT_REPEAT_MS) {
+            lastEndPromptAt = Date.now();
+            speak('Feel for the tactile pavement, and press the screen once you have finished crossing.');
+        }
+        return;
+    }
     const stalledFor = Date.now() - lastCrossingProgressAt;
     if (stalledFor >= CROSSING_STALL_WARNING_MS && !crossingStallWarned) {
         crossingStallWarned = true;
@@ -331,6 +347,7 @@ function checkCrossingStall() {
 function completeCrossing() {
     if (currentState !== STATES.CROSSING) return;
     crossingLocked = false;  // genuine finish -> release the crossing lock
+    crossingEndPending = false;
     crossingStartHeading = null;
     crossingStartLocation = null;
     stopCrossingHaptics();  // leaving CROSSING -> stop the steady guidance pulse
@@ -368,11 +385,12 @@ function startGpsTracking() {
             }
 
             if (currentState === STATES.CROSSING && crossingStartLocation) {
-                // Trust GPS during a crossing ONLY when the fix is accurate. A
-                // lost/reacquired signal reports a large accuracy radius and a
-                // jumped position; feeding that to the distance check used to
-                // end the crossing mid-road. Skip such fixes entirely -- the
-                // vision arrival, stall check and absolute ceiling still finish.
+                // GPS does NOT decide when the crossing is finished -- vision
+                // arrival + the user's tap confirmation do that. Here GPS is only
+                // used to feed the stall detector (has the user stopped moving?),
+                // and only when the fix is accurate: a lost/reacquired signal
+                // reports a large accuracy radius and a jumped position that would
+                // otherwise be read as false forward progress.
                 if (currentLocation.accuracyMeters > CROSSING_GPS_MAX_ACCURACY_M) {
                     debugLog('Crossing: ignoring low-accuracy GPS fix (±' +
                         currentLocation.accuracyMeters.toFixed(0) + 'm)');
@@ -387,10 +405,6 @@ function startGpsTracking() {
                         lastCrossingDistance = moved;
                         lastCrossingProgressAt = Date.now();
                         crossingStallWarned = false;
-                    }
-
-                    if (moved >= CROSSING_DISTANCE_THRESHOLD_M) {
-                        completeCrossing();
                     }
                 }
             }
@@ -620,6 +634,7 @@ window.navassist.onGreenCross = function() {
         // Lock the app into crossing mode: from here nothing can pull the state
         // out of CROSSING except a genuine finish or losing the glasses.
         crossingLocked = true;
+        crossingEndPending = false;
 
         lastCrossingDistance = 0;
         lastCrossingProgressAt = Date.now();
@@ -659,8 +674,17 @@ window.navassist.onCorridorDirection = function(direction) {
     lastCorridorAt = Date.now();
 };
 
+// Vision thinks the crossing is ending (dashes gone, far light close/absent).
+// Rather than declaring the crossing complete outright, warn the user and hand
+// the final call to them: they feel for the tactile pavement and tap the screen
+// once safely across. Re-fires per frame -- the guard makes it announce once.
 window.navassist.onVisionArrivalSignal = function() {
-    completeCrossing();
+    if (currentState !== STATES.CROSSING) return;
+    if (crossingEndPending) return;
+    crossingEndPending = true;
+    lastEndPromptAt = Date.now();
+    sendHaptic('both', 'pulse', 0.8, 400);
+    speak('Crossing ending soon. Please feel for the tactile pavement, and press the screen once you have finished crossing.');
 };
 
 // ============================================================
@@ -708,6 +732,15 @@ function classifyGesture(count) {
     const gestureMap = { 1: 'single_tap', 2: 'double_tap', 3: 'triple_tap' };
     const gesture = gestureMap[Math.min(count, 3)];
     if (!gesture) return;
+
+    // Finish-crossing confirmation. This is the ONE tap allowed mid-crossing:
+    // once vision has warned the crossing is ending, a single tap is how the
+    // user tells the app they've reached the far kerb. Handled before the
+    // crossing lock / normal rules so it isn't swallowed by them.
+    if (currentState === STATES.CROSSING && crossingEndPending && gesture === 'single_tap') {
+        completeCrossing();
+        return;
+    }
 
     const rules = GESTURE_RULES[currentState] || {};
     const intent = rules[gesture];

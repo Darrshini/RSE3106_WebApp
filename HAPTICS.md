@@ -124,8 +124,8 @@ Both buttons are the only haptic path on that page. A traffic light detected on 
 **never** move a motor on its own. Same for `webcam.html`. That is by design, not a bug.
 
 Haptics only fire automatically from `app.js`, i.e. **`index.html`**, and only in specific states.
-The flow is **vision-driven** — there are **no double/triple-tap confirmations**; the only taps
-are a single tap to start scanning and a single tap to reset after a crossing:
+The flow is **vision-driven** — there are **no double/triple-tap confirmations**; the only taps are
+single taps: one to start scanning, one to confirm you've finished crossing, and one to reset after:
 - `onDirectionDecided` (`app.js:590`) buzzes toward the traffic-light post only while **`NAVIGATING`**
 - `onGreenDirection` (`app.js:639`) buzzes the green-man side while **`WAITING`** or **`SCANNING`**
 - **Crossing guidance** — while **`CROSSING`**, `crossingHapticTick()` (`app.js:556`) fires a
@@ -136,9 +136,16 @@ are a single tap to start scanning and a single tap to reset after a crossing:
 
 Reaching those states needs **no taps**: a traffic-light *post* advances **SCANNING → NAVIGATING**
 automatically, and a green man advances **WAITING → CROSSING** automatically (`onGreenCross`,
-`app.js:609`). Once crossing starts the app is **locked into `CROSSING`** (`crossingLocked`,
-`app.js:63`) — nothing can pull the state out of it except a genuine finish or losing the glasses,
-so a GPS glitch or a stray tap can't interrupt a wearer mid-road.
+`app.js:609`). Once crossing starts the app is **locked into `CROSSING`** (`crossingLocked`) —
+nothing can pull the state out of it except a genuine finish or losing the glasses, so a GPS glitch
+or a stray tap can't interrupt a wearer mid-road.
+
+**Finishing the crossing is the one mid-road tap.** GPS does **not** decide you've crossed. When
+vision judges you're nearing the far kerb — the dashes have run out and the far light is close or
+gone — `onVisionArrivalSignal` (`app.js`) buzzes **both motors once** and speaks a warning to feel
+for the tactile pavement and press the screen. That arms `crossingEndPending`; a **single tap** then
+completes the crossing (a 90 s ceiling completes it anyway if the user never taps). Until they tap,
+the stall check re-prompts on `END_PROMPT_REPEAT_MS` (6 s) instead of the usual "keep going" nudge.
 
 So opening `index.html` and pointing at a **green man** *does* buzz toward it (via `onGreenDirection`
 while `SCANNING`/`WAITING`) — but the steady crossing cadence only begins once you're actually

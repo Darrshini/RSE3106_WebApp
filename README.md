@@ -52,10 +52,17 @@ All the *decisions* (state machine, GPS/crossing logic, speech, haptics) live in
 **The flow is vision-driven.** There are no double/triple-tap confirmations to memorise: you tap
 once to start scanning, and from there the app advances itself — it identifies the crossing and
 guides you toward it, reads the signal, and starts you across on the green man, all automatically.
-The only other tap is a single tap to reset once you've crossed. While you're physically crossing,
-the app is **locked into crossing mode** (a GPS glitch or a stray tap can't interrupt the guidance
-mid-road); the haptics settle into a steady pulse — **both motors = go straight, one side = veer
-that way** — until you reach the other side.
+While you're physically crossing, the app is **locked into crossing mode** (a GPS glitch or a stray
+tap can't interrupt the guidance mid-road); the haptics settle into a steady pulse — **both motors =
+go straight, one side = veer that way**.
+
+When vision judges you're nearing the far kerb (the crossing dashes have run out and the far-side
+light is right in front of you or gone), the app **warns you and hands the final call to you**: it
+says *"Crossing ending soon — feel for the tactile pavement, and press the screen once you've
+finished crossing,"* and a **single tap** confirms you're safely across. GPS is **not** used to
+decide you've crossed — it only guides you to the junction beforehand and feeds the "are you still
+moving?" stall check. There's one further single tap: to reset once you've crossed. (A 90-second
+safety ceiling completes the crossing on its own if you never tap, so you can't get stuck locked in.)
 
 ### Hardware history
 

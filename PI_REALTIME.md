@@ -189,7 +189,7 @@ dead ESP32 path; delete it whenever you like.
 | `server.js` | `/pi` + `/live` relay, backpressure, `PI_ROTATE`, pumps frames into the crossing worker. |
 | `crossing_worker.js` | Worker thread. Keeps `crossing_seg.onnx` off the event loop. |
 | `crossing_infer.js` | The actual seg model + `sharp` preprocessing + mask decode. |
-| `public/js/app.js` | `/live` socket, binary vs JSON split, GPS, the vision-driven state machine (no tap confirmations; single-tap start/reset only), speech, and haptics — including the steady crossing-guidance cadence and the crossing lock. |
+| `public/js/app.js` | `/live` socket, binary vs JSON split, GPS, the vision-driven state machine (no tap confirmations; single taps only — start, confirm-finished-crossing, reset), speech, and haptics — including the steady crossing-guidance cadence, the crossing lock, and the vision-warns-then-user-taps finish. GPS guides to the junction and feeds the stall check; it does **not** decide the crossing is over. |
 | `public/js/ai.js` | Decode → rotate → draw the frame + the `crossing/result` overlay, and fold that result into the state machine (light state → cues, corridor → guidance). Runs **no browser model**. |
 | `public/js/pi.js` | `pi.html`'s test bench. Same feed, same models, plus HUD and confidence slider. |
 
